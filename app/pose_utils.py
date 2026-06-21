@@ -33,20 +33,31 @@ from mediapipe.tasks.python.vision import RunningMode
 from app import video_utils
 
 # Skip drawing / center math when visibility or presence is below this.
-_VISIBILITY_THRESHOLD = 0.5
+_VISIBILITY_THRESHOLD = 0.55
 
 # Narrow shoulder/hip span (normalized x) → treat as side-on; be conservative on legs.
 _PROFILE_SHOULDER_W = 0.06
 _PROFILE_HIP_W = 0.052
-_LEG_DOMINANCE_GAP = 0.22  # suppress weaker leg if scores differ by this much in profile
+_LEG_DOMINANCE_GAP = 0.32  # suppress only clearly lost weaker legs in profile
+_LEG_SUPPRESS_DISTAL_SCORE = 0.46
 
 # Per-limb absence: brief joint hold (seconds at source FPS), then hard drop (no limb draw).
 _LIMB_HARD_DROP_SEC = 1.0
 # While a limb is "weak" but not yet dropped, allow joint holds up to this many frames-worth.
-_LIMB_OCCLUSION_HOLD_SEC = 0.55
+_LIMB_OCCLUSION_HOLD_SEC = 0.22
 # Core joints must all score below this to count as "fully lost" for absent counter.
 _LIMB_ALL_LOST_SCORE = 0.42
 _DEFAULT_STABILIZATION_FPS = 30.0
+
+# When a pose first appears after a title card/fade-in, MediaPipe can return a
+# plausible but awkward first body. Hold drawing briefly until the track settles.
+_POSE_INITIAL_LOCK_FRAMES = 10
+
+# Whole-pose confidence gate. Per-joint gates still decide which limbs draw, but
+# these thresholds stop low-confidence frames from drawing any skeleton at all.
+_POSE_FRAME_MIN_TORSO_AVG_SCORE = 0.58
+_POSE_FRAME_MIN_CORE_AVG_SCORE = 0.56
+_POSE_FRAME_MIN_CORE_VISIBLE = 5
 
 # MediaPipe pose indices (same as PoseLandmark enum).
 _NOSE = 0
@@ -63,6 +74,16 @@ _RIGHT_KNEE = 26
 _LEFT_ANKLE = 27
 _RIGHT_ANKLE = 28
 _TORSO_INDICES = (_LEFT_SHOULDER, _RIGHT_SHOULDER, _LEFT_HIP, _RIGHT_HIP)
+_CORE_BODY_INDICES = (
+    _LEFT_SHOULDER,
+    _RIGHT_SHOULDER,
+    _LEFT_HIP,
+    _RIGHT_HIP,
+    _LEFT_KNEE,
+    _RIGHT_KNEE,
+    _LEFT_ANKLE,
+    _RIGHT_ANKLE,
+)
 
 # Face landmark indices use a simplified head model instead of dense points.
 _FACE_INDICES = frozenset(range(0, 11))
@@ -77,30 +98,18 @@ _TORSO_SEGMENTS: Tuple[Tuple[int, int], ...] = (
 _LEFT_ARM_SEGMENTS: Tuple[Tuple[int, int], ...] = (
     (11, 13),
     (13, 15),
-    (15, 17),
-    (15, 19),
-    (15, 21),
-    (17, 19),
 )
 _RIGHT_ARM_SEGMENTS: Tuple[Tuple[int, int], ...] = (
     (12, 14),
     (14, 16),
-    (16, 18),
-    (16, 20),
-    (16, 22),
-    (18, 20),
 )
 _LEFT_LEG_SEGMENTS: Tuple[Tuple[int, int], ...] = (
     (_LEFT_HIP, _LEFT_KNEE),
     (_LEFT_KNEE, _LEFT_ANKLE),
-    (_LEFT_ANKLE, 29),
-    (_LEFT_ANKLE, 31),
 )
 _RIGHT_LEG_SEGMENTS: Tuple[Tuple[int, int], ...] = (
     (_RIGHT_HIP, _RIGHT_KNEE),
     (_RIGHT_KNEE, _RIGHT_ANKLE),
-    (_RIGHT_ANKLE, 30),
-    (_RIGHT_ANKLE, 32),
 )
 
 _MAX_POSES = 6
@@ -114,6 +123,10 @@ _LINE_THICKNESS = 3
 _HEAD_POINT_RADIUS = 4
 _HEAD_DIAMOND_COLOR = (200, 200, 60)
 _HEAD_DIAMOND_THICK = 1
+_HEAD_COMPASS_MAX_SPAN = 0.075
+_TORSO_DECROSS_MIN_PAIR_SPAN_PX = 9
+_COMPACT_DRAW_SHOULDER_W = 0.085
+_COMPACT_DRAW_HIP_W = 0.075
 
 # Estimated / held leg segments (temporal fill-in).
 _FAINT_LINE_SCALE = 0.65  # relative to line_thickness
@@ -169,16 +182,37 @@ class BodyPartPolicy:
     solid_threshold: float
     max_hold_frames: int
     smoothing_alpha: float
+    max_jump_fraction: float
 
 
 # Torso / shoulders / hips — strongest smoothing, longest hold.
-TORSO_POLICY = BodyPartPolicy(solid_threshold=0.44, max_hold_frames=8, smoothing_alpha=0.38)
+TORSO_POLICY = BodyPartPolicy(
+    solid_threshold=0.5,
+    max_hold_frames=5,
+    smoothing_alpha=0.5,
+    max_jump_fraction=0.18,
+)
 # Arms — medium responsiveness; partial arms when wrist/elbow weak.
-ARM_POLICY = BodyPartPolicy(solid_threshold=0.5, max_hold_frames=5, smoothing_alpha=0.58)
+ARM_POLICY = BodyPartPolicy(
+    solid_threshold=0.58,
+    max_hold_frames=2,
+    smoothing_alpha=0.72,
+    max_jump_fraction=0.42,
+)
 # Legs — match prior behavior; profile suppression stays separate.
-LEG_POLICY = BodyPartPolicy(solid_threshold=0.5, max_hold_frames=5, smoothing_alpha=0.52)
+LEG_POLICY = BodyPartPolicy(
+    solid_threshold=0.58,
+    max_hold_frames=2,
+    smoothing_alpha=0.68,
+    max_jump_fraction=0.32,
+)
 # Simplified head compass — light smoothing only.
-HEAD_COMPASS_POLICY = BodyPartPolicy(solid_threshold=0.0, max_hold_frames=4, smoothing_alpha=0.78)
+HEAD_COMPASS_POLICY = BodyPartPolicy(
+    solid_threshold=0.0,
+    max_hold_frames=2,
+    smoothing_alpha=0.74,
+    max_jump_fraction=0.18,
+)
 
 
 @dataclass
@@ -187,6 +221,14 @@ class LimbTrack:
 
     consecutive_lost_frames: int = 0
     dropped: bool = False
+
+
+@dataclass
+class PoseStartupLock:
+    """Short startup gate before drawing a newly detected body track."""
+
+    warmup_frames: int = 0
+    locked_once: bool = False
 
 
 # Per-limb stabilization: ``core`` drives absence/hold/drop; ``mask`` clears cache when dropped.
@@ -237,6 +279,8 @@ class PoseDrawTemporalState:
         self._tracks: Dict[Tuple[int, int], JointTrack] = {}
         self._head_tracks: Dict[Tuple[int, str], JointTrack] = {}
         self._limb_tracks: Dict[Tuple[int, str], LimbTrack] = {}
+        self._startup_locks: Dict[int, PoseStartupLock] = {}
+        self.last_center_norm: Optional[Tuple[float, float]] = None
 
     def begin_frame(self, active_person_indices: set[int]) -> None:
         stale = [k for k in self._tracks if k[0] not in active_person_indices]
@@ -248,6 +292,13 @@ class PoseDrawTemporalState:
         stale_l = [k for k in self._limb_tracks if k[0] not in active_person_indices]
         for k in stale_l:
             del self._limb_tracks[k]
+        stale_s = [
+            k
+            for k, v in self._startup_locks.items()
+            if k not in active_person_indices and not v.locked_once
+        ]
+        for k in stale_s:
+            del self._startup_locks[k]
 
     def track_for(self, person: int, lm_index: int) -> JointTrack:
         k = (person, lm_index)
@@ -266,6 +317,21 @@ class PoseDrawTemporalState:
         if k not in self._limb_tracks:
             self._limb_tracks[k] = LimbTrack()
         return self._limb_tracks[k]
+
+    def startup_lock_for(self, person: int) -> PoseStartupLock:
+        if person not in self._startup_locks:
+            self._startup_locks[person] = PoseStartupLock()
+        return self._startup_locks[person]
+
+    def ready_to_draw_pose(self, person: int) -> bool:
+        lock = self.startup_lock_for(person)
+        if lock.locked_once:
+            return True
+        lock.warmup_frames += 1
+        if lock.warmup_frames >= _POSE_INITIAL_LOCK_FRAMES:
+            lock.locked_once = True
+            return True
+        return False
 
 
 def _policy_for_landmark_index(idx: int) -> BodyPartPolicy:
@@ -303,6 +369,18 @@ def resolve_joint_display(
     tr = temporal_state.track_for(person_index, lm_index)
     if px_now is not None:
         sx, sy = float(px_now[0]), float(px_now[1])
+        if tr.smooth_xy is not None:
+            ox, oy = tr.smooth_xy
+            max_jump = max(24.0, policy.max_jump_fraction * min(w, h))
+            if math.hypot(sx - ox, sy - oy) > max_jump:
+                px_now = None
+        if px_now is None:
+            tr.miss_streak += 1
+            if tr.last_px is not None and max_hold > 0 and tr.miss_streak <= max_hold:
+                return tr.last_px, "held"
+            tr.last_px = None
+            tr.smooth_xy = None
+            return None, "none"
         if tr.smooth_xy is None:
             tr.smooth_xy = (sx, sy)
         else:
@@ -494,6 +572,98 @@ def _draw_segments_from_cache(
             cv2.line(bgr, pa, pb, line_color, line_thickness, lineType=cv2.LINE_AA)
 
 
+def _draw_styled_line(
+    bgr: np.ndarray,
+    pa: Tuple[int, int],
+    pb: Tuple[int, int],
+    *,
+    style_a: str,
+    style_b: str,
+    line_color: Tuple[int, int, int],
+    line_thickness: int,
+) -> None:
+    faint_thickness = max(1, int(line_thickness * _FAINT_LINE_SCALE))
+    faint_line = tuple(max(0, c - 55) for c in line_color)
+    if style_a == "held" or style_b == "held":
+        cv2.line(bgr, pa, pb, faint_line, faint_thickness, lineType=cv2.LINE_AA)
+    else:
+        cv2.line(bgr, pa, pb, line_color, line_thickness, lineType=cv2.LINE_AA)
+
+
+def _midpoint_from_cache(
+    cache: Dict[int, Tuple[Optional[Tuple[int, int]], str]],
+    a: int,
+    b: int,
+) -> Tuple[Optional[Tuple[int, int]], str]:
+    pa, sa = cache.get(a, (None, "none"))
+    pb, sb = cache.get(b, (None, "none"))
+    if pa is None and pb is None:
+        return None, "none"
+    if pa is None:
+        return pb, sb
+    if pb is None:
+        return pa, sa
+    style = "held" if sa == "held" or sb == "held" else "solid"
+    return ((pa[0] + pb[0]) // 2, (pa[1] + pb[1]) // 2), style
+
+
+def _draw_compact_torso_from_cache(
+    bgr: np.ndarray,
+    cache: Dict[int, Tuple[Optional[Tuple[int, int]], str]],
+    *,
+    line_color: Tuple[int, int, int],
+    line_thickness: int,
+) -> None:
+    shoulder_mid, shoulder_style = _midpoint_from_cache(
+        cache, _LEFT_SHOULDER, _RIGHT_SHOULDER
+    )
+    hip_mid, hip_style = _midpoint_from_cache(cache, _LEFT_HIP, _RIGHT_HIP)
+    if shoulder_mid is not None and hip_mid is not None:
+        _draw_styled_line(
+            bgr,
+            shoulder_mid,
+            hip_mid,
+            style_a=shoulder_style,
+            style_b=hip_style,
+            line_color=line_color,
+            line_thickness=line_thickness,
+        )
+    _draw_segments_from_cache(
+        bgr,
+        ((_LEFT_SHOULDER, _RIGHT_SHOULDER), (_LEFT_HIP, _RIGHT_HIP)),
+        cache,
+        line_color=line_color,
+        line_thickness=line_thickness,
+    )
+
+
+def _compact_lower_leg_segments(
+    segments: Sequence[Tuple[int, int]],
+) -> List[Tuple[int, int]]:
+    return [
+        seg
+        for seg in segments
+        if seg in ((_LEFT_KNEE, _LEFT_ANKLE), (_RIGHT_KNEE, _RIGHT_ANKLE))
+    ]
+
+
+def _draw_compact_legs_from_cache(
+    bgr: np.ndarray,
+    segments: Sequence[Tuple[int, int]],
+    cache: Dict[int, Tuple[Optional[Tuple[int, int]], str]],
+    *,
+    line_color: Tuple[int, int, int],
+    line_thickness: int,
+) -> None:
+    _draw_segments_from_cache(
+        bgr,
+        _compact_lower_leg_segments(segments),
+        cache,
+        line_color=line_color,
+        line_thickness=line_thickness,
+    )
+
+
 def _draw_joint_dots_from_cache(
     bgr: np.ndarray,
     indices: set[int],
@@ -510,6 +680,63 @@ def _draw_joint_dots_from_cache(
         col = faint_point if st == "held" else point_color
         cv2.circle(bgr, px, pr, col, -1, lineType=cv2.LINE_AA)
         cv2.circle(bgr, px, pr, (0, 60, 0), 1, lineType=cv2.LINE_AA)
+
+
+def _pair_x_polarity(
+    cache: Dict[int, Tuple[Optional[Tuple[int, int]], str]],
+    left_idx: int,
+    right_idx: int,
+    *,
+    min_span_px: float,
+) -> Optional[int]:
+    left_px, _ = cache.get(left_idx, (None, "none"))
+    right_px, _ = cache.get(right_idx, (None, "none"))
+    if left_px is None or right_px is None:
+        return None
+    dx = left_px[0] - right_px[0]
+    if abs(dx) < min_span_px:
+        return None
+    return 1 if dx > 0 else -1
+
+
+def _swap_cache_entries(
+    cache: Dict[int, Tuple[Optional[Tuple[int, int]], str]],
+    a: int,
+    b: int,
+) -> None:
+    cache[a], cache[b] = cache.get(b, (None, "none")), cache.get(a, (None, "none"))
+
+
+def _decross_torso_cache_for_drawing(
+    cache: Dict[int, Tuple[Optional[Tuple[int, int]], str]],
+    *,
+    frame_width: int,
+) -> Dict[int, Tuple[Optional[Tuple[int, int]], str]]:
+    """
+    Keep the rendered torso from flipping when MediaPipe swaps one left/right pair.
+
+    Pose labels are anatomical, but in side-on/crouched frames the lower-body labels
+    can briefly invert while shoulders stay stable. For overlay drawing only, swap the
+    lower-body pairs so shoulder and hip x-order agree and torso lines do not cross.
+    """
+    min_span = max(float(_TORSO_DECROSS_MIN_PAIR_SPAN_PX), frame_width * 0.025)
+    shoulder_pol = _pair_x_polarity(
+        cache, _LEFT_SHOULDER, _RIGHT_SHOULDER, min_span_px=min_span
+    )
+    hip_pol = _pair_x_polarity(
+        cache, _LEFT_HIP, _RIGHT_HIP, min_span_px=min_span
+    )
+    if shoulder_pol is None or hip_pol is None or shoulder_pol == hip_pol:
+        return cache
+
+    corrected = dict(cache)
+    for a, b in (
+        (_LEFT_HIP, _RIGHT_HIP),
+        (_LEFT_KNEE, _RIGHT_KNEE),
+        (_LEFT_ANKLE, _RIGHT_ANKLE),
+    ):
+        _swap_cache_entries(corrected, a, b)
+    return corrected
 
 
 def _stabilize_head_compass_pixel(
@@ -578,9 +805,9 @@ def create_pose_landmarker(
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=run_mode,
         num_poses=num_poses,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_pose_detection_confidence=0.6,
+        min_pose_presence_confidence=0.6,
+        min_tracking_confidence=0.6,
         output_segmentation_masks=False,
     )
     return PoseLandmarker.create_from_options(options)
@@ -702,13 +929,16 @@ def _head_compass_norm(landmarks: List[Any]) -> Optional[Dict[str, Tuple[float, 
             0.028,
             math.hypot(e_pt[0] - w_pt[0], e_pt[1] - w_pt[1]) * 0.58,
         )
+        span = min(span, _HEAD_COMPASS_MAX_SPAN)
     elif left_side:
         w_pt = left_side
         span = max(0.028, 2.0 * abs(center[0] - w_pt[0]), 0.04)
+        span = min(span, _HEAD_COMPASS_MAX_SPAN)
         e_pt = (center[0] + (center[0] - w_pt[0]), center[1])
     elif right_side:
         e_pt = right_side
         span = max(0.028, 2.0 * abs(e_pt[0] - center[0]), 0.04)
+        span = min(span, _HEAD_COMPASS_MAX_SPAN)
         w_pt = (center[0] - (e_pt[0] - center[0]), center[1])
     else:
         span = 0.038
@@ -752,20 +982,40 @@ def _is_profile_like_pose(landmarks: List[Any]) -> bool:
     return sh_w < _PROFILE_SHOULDER_W or hip_w < _PROFILE_HIP_W
 
 
-def _leg_chain_min_score(landmarks: List[Any], hip: int, knee: int, ankle: int) -> float:
+def _needs_compact_body_draw(landmarks: List[Any]) -> bool:
+    sh_w, hip_w = _shoulder_hip_widths_norm(landmarks)
+    return sh_w < _COMPACT_DRAW_SHOULDER_W or hip_w < _COMPACT_DRAW_HIP_W
+
+
+def _leg_chain_avg_score(landmarks: List[Any], hip: int, knee: int, ankle: int) -> float:
     idxs = [hip, knee, ankle]
     scores = [_joint_score(landmarks[i]) for i in idxs if i < len(landmarks)]
-    return min(scores) if scores else 0.0
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _leg_distal_lost(landmarks: List[Any], knee: int, ankle: int) -> bool:
+    if knee >= len(landmarks) or ankle >= len(landmarks):
+        return True
+    return (
+        _joint_score(landmarks[knee]) < _LEG_SUPPRESS_DISTAL_SCORE
+        and _joint_score(landmarks[ankle]) < _LEG_SUPPRESS_DISTAL_SCORE
+    )
 
 
 def _leg_suppression_flags(landmarks: List[Any]) -> Tuple[bool, bool]:
     """In side-like views, omit the likely occluded (weaker) leg entirely."""
     if not _is_profile_like_pose(landmarks):
         return False, False
-    left_m = _leg_chain_min_score(landmarks, _LEFT_HIP, _LEFT_KNEE, _LEFT_ANKLE)
-    right_m = _leg_chain_min_score(landmarks, _RIGHT_HIP, _RIGHT_KNEE, _RIGHT_ANKLE)
-    suppress_l = left_m + _LEG_DOMINANCE_GAP < right_m and left_m < 0.52
-    suppress_r = right_m + _LEG_DOMINANCE_GAP < left_m and right_m < 0.52
+    left_m = _leg_chain_avg_score(landmarks, _LEFT_HIP, _LEFT_KNEE, _LEFT_ANKLE)
+    right_m = _leg_chain_avg_score(landmarks, _RIGHT_HIP, _RIGHT_KNEE, _RIGHT_ANKLE)
+    suppress_l = (
+        left_m + _LEG_DOMINANCE_GAP < right_m
+        and _leg_distal_lost(landmarks, _LEFT_KNEE, _LEFT_ANKLE)
+    )
+    suppress_r = (
+        right_m + _LEG_DOMINANCE_GAP < left_m
+        and _leg_distal_lost(landmarks, _RIGHT_KNEE, _RIGHT_ANKLE)
+    )
     return suppress_l, suppress_r
 
 
@@ -847,6 +1097,7 @@ def select_center_person_index(
     persons: List[List[Any]],
     width: int,
     height: int,
+    previous_center: Optional[Tuple[float, float]] = None,
 ) -> Optional[int]:
     """
     Pick the person whose body center is closest to the image center (pixel space).
@@ -866,7 +1117,14 @@ def select_center_person_index(
             continue
         px = nc[0] * width
         py = nc[1] * height
-        d2 = (px - cx) ** 2 + (py - cy) ** 2
+        frame_center_d2 = (px - cx) ** 2 + (py - cy) ** 2
+        if previous_center is not None:
+            pcx = previous_center[0] * width
+            pcy = previous_center[1] * height
+            prev_d2 = (px - pcx) ** 2 + (py - pcy) ** 2
+            d2 = 0.35 * frame_center_d2 + 0.65 * prev_d2
+        else:
+            d2 = frame_center_d2
         if d2 < best_d2:
             best_d2 = d2
             best_i = i
@@ -874,6 +1132,53 @@ def select_center_person_index(
     if best_i is not None:
         return best_i
     return 0
+
+
+def _pose_has_usable_torso(landmarks: Sequence[Any]) -> bool:
+    """Avoid drawing hallucinated partial poses that lack a stable body anchor."""
+    ls = _norm_xy_if_visible(landmarks, _LEFT_SHOULDER)
+    rs = _norm_xy_if_visible(landmarks, _RIGHT_SHOULDER)
+    lh = _norm_xy_if_visible(landmarks, _LEFT_HIP)
+    rh = _norm_xy_if_visible(landmarks, _RIGHT_HIP)
+    shoulder_pair = ls is not None and rs is not None
+    hip_count = int(lh is not None) + int(rh is not None)
+    if not shoulder_pair or hip_count < 1:
+        return False
+    sh_w = math.hypot(rs[0] - ls[0], rs[1] - ls[1])
+    if sh_w < 0.025:
+        return False
+    return True
+
+
+def _pose_is_confident_enough(landmarks: Sequence[Any]) -> bool:
+    """Frame-level confidence gate before drawing a whole skeleton."""
+    if not _pose_has_usable_torso(landmarks):
+        return False
+
+    torso_scores = [
+        _joint_score(landmarks[i])
+        for i in _TORSO_INDICES
+        if i < len(landmarks)
+    ]
+    if not torso_scores:
+        return False
+    if sum(torso_scores) / len(torso_scores) < _POSE_FRAME_MIN_TORSO_AVG_SCORE:
+        return False
+
+    core_scores = [
+        _joint_score(landmarks[i])
+        for i in _CORE_BODY_INDICES
+        if i < len(landmarks)
+    ]
+    if not core_scores:
+        return False
+    visible_core = sum(score >= _VISIBILITY_THRESHOLD for score in core_scores)
+    if visible_core < _POSE_FRAME_MIN_CORE_VISIBLE:
+        return False
+    if sum(core_scores) / len(core_scores) < _POSE_FRAME_MIN_CORE_AVG_SCORE:
+        return False
+
+    return True
 
 
 def extract_pose_persons(
@@ -967,6 +1272,8 @@ def _annotate_legacy_single(
 
     out = bgr.copy()
     if result.pose_landmarks:
+        if temporal_state is not None:
+            temporal_state.begin_frame({0})
         _draw_pose_landmarks(
             out,
             result.pose_landmarks[0],
@@ -975,6 +1282,8 @@ def _annotate_legacy_single(
             stabilization_fps=stabilization_fps,
         )
         return AnnotateResult(image=out, num_people=1, center_person_index=0)
+    if temporal_state is not None:
+        temporal_state.begin_frame(set())
     return AnnotateResult(image=out, num_people=0, center_person_index=None)
 
 
@@ -991,23 +1300,32 @@ def _draw_pose_landmarks(
     stabilization_fps: Optional[float] = None,
 ) -> None:
     h, w = bgr.shape[:2]
-    if not landmarks:
+    if not landmarks or not _pose_is_confident_enough(landmarks):
+        return
+    if temporal_state is not None and not temporal_state.ready_to_draw_pose(person_index):
         return
 
     suppress_left, suppress_right = _leg_suppression_flags(landmarks)
+    compact_body = _needs_compact_body_draw(landmarks)
 
-    segment_layers: List[Sequence[Tuple[int, int]]] = [
-        _TORSO_SEGMENTS,
-        _LEFT_ARM_SEGMENTS,
-        _RIGHT_ARM_SEGMENTS,
-    ]
+    segment_layers: List[Sequence[Tuple[int, int]]] = []
+    if not compact_body:
+        segment_layers.append(_TORSO_SEGMENTS)
+    segment_layers.extend((_LEFT_ARM_SEGMENTS, _RIGHT_ARM_SEGMENTS))
+    leg_layers: List[Sequence[Tuple[int, int]]] = []
     if not suppress_left:
-        segment_layers.append(_LEFT_LEG_SEGMENTS)
+        leg_layers.append(_LEFT_LEG_SEGMENTS)
     if not suppress_right:
-        segment_layers.append(_RIGHT_LEG_SEGMENTS)
+        leg_layers.append(_RIGHT_LEG_SEGMENTS)
+    if not compact_body:
+        segment_layers.extend(leg_layers)
 
     all_idx: set[int] = set()
-    for layer in segment_layers:
+    index_layers: List[Sequence[Tuple[int, int]]] = list(segment_layers)
+    if compact_body:
+        index_layers.extend(leg_layers)
+        index_layers.append(_TORSO_SEGMENTS)
+    for layer in index_layers:
         for a, b in layer:
             all_idx.add(a)
             all_idx.add(b)
@@ -1038,15 +1356,40 @@ def _draw_pose_landmarks(
             suppress_left_leg=suppress_left,
             suppress_right_leg=suppress_right,
         )
+    cache = _decross_torso_cache_for_drawing(cache, frame_width=w)
 
-    for layer in segment_layers:
-        _draw_segments_from_cache(
+    if compact_body:
+        _draw_compact_torso_from_cache(
             bgr,
-            layer,
             cache,
             line_color=line_color,
             line_thickness=line_thickness,
         )
+        for layer in (_LEFT_ARM_SEGMENTS, _RIGHT_ARM_SEGMENTS):
+            _draw_segments_from_cache(
+                bgr,
+                layer,
+                cache,
+                line_color=line_color,
+                line_thickness=line_thickness,
+            )
+        compact_leg_segments = tuple(seg for layer in leg_layers for seg in layer)
+        _draw_compact_legs_from_cache(
+            bgr,
+            compact_leg_segments,
+            cache,
+            line_color=line_color,
+            line_thickness=line_thickness,
+        )
+    else:
+        for layer in segment_layers:
+            _draw_segments_from_cache(
+                bgr,
+                layer,
+                cache,
+                line_color=line_color,
+                line_thickness=line_thickness,
+            )
 
     _draw_joint_dots_from_cache(bgr, all_idx, cache, point_color, point_radius)
 
@@ -1102,12 +1445,17 @@ def annotate_frame(
     out = bgr.copy()
 
     if not persons:
+        if temporal_state is not None:
+            temporal_state.begin_frame(set())
         return AnnotateResult(image=out, num_people=0, center_person_index=None)
 
     if temporal_state is not None:
         temporal_state.begin_frame(set(range(len(persons))))
 
-    center_idx = select_center_person_index(persons, w, h)
+    prev_center = temporal_state.last_center_norm if temporal_state is not None else None
+    center_idx = select_center_person_index(persons, w, h, prev_center)
+    if temporal_state is not None and center_idx is not None:
+        temporal_state.last_center_norm = body_center_normalized(persons[center_idx])
 
     if mode == DetectionMode.CENTER_ONLY:
         if 0 <= center_idx < len(persons):

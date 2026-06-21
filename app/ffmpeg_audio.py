@@ -26,7 +26,19 @@ class AudioMuxOutcome:
 
 
 def find_ffmpeg() -> str | None:
-    return shutil.which("ffmpeg")
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    try:
+        import imageio_ffmpeg
+
+        bundled_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        logger.debug("Bundled imageio-ffmpeg unavailable: %s", e)
+        return None
+    if bundled_ffmpeg and Path(bundled_ffmpeg).is_file():
+        return bundled_ffmpeg
+    return None
 
 
 def _find_ffprobe() -> str | None:
@@ -122,8 +134,8 @@ def mux_processed_with_source_audio(
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         msg = (
-            "ffmpeg was not found on PATH. Install ffmpeg to merge original audio "
-            "(e.g. on macOS: brew install ffmpeg). Using silent processed video only."
+            "ffmpeg was not found. Install ffmpeg or reinstall requirements to merge "
+            "original audio. Using silent processed video only."
         )
         logger.warning(msg)
         return AudioMuxOutcome(

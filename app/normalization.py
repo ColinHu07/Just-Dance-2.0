@@ -109,6 +109,7 @@ def normalize_landmarks_to_xy(
     for i in range(min(33, len(landmarks))):
         p = pose_utils.norm_xy_if_visible(landmarks, i)
         if p is None:
+            rel[i] = 0.0
             continue
         xy[i, 0] = (p[0] - ox) / scale
         xy[i, 1] = (p[1] - oy) / scale

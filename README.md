@@ -44,6 +44,48 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Frontend background reel
+
+The Frontend can use a looping local MP4 background:
+
+- `app/assets/frontend-dance-bg.mp4` — animated background, used when present.
+- `app/assets/frontend-dance-bg.png` — still fallback, used when the MP4 is missing.
+
+Build the MP4 from local videos you have permission to use:
+
+```bash
+python tools/build_frontend_background.py ~/Videos/dance-clips \
+  --clips-per-video 6 \
+  --clip-duration 2 \
+  --max-total-duration 60 \
+  --fit blur
+```
+
+For hand-picked moments, use a manifest:
+
+```json
+{
+  "videos": [
+    {
+      "path": "clips/example.mp4",
+      "segments": [
+        { "start": 12.5, "duration": 2.0 },
+        { "start": 43.0, "duration": 2.0 }
+      ]
+    }
+  ]
+}
+```
+
+Then run:
+
+```bash
+python tools/build_frontend_background.py --manifest reel_manifest.json
+```
+
+The output is muted and written to `app/assets/frontend-dance-bg.mp4`. Use `--fit blur`
+for mixed aspect ratios: the full dance frame is preserved over a blurred 16:9 fill.
+
 ## Usage
 
 1. **Load Video** — or drag-and-drop a file onto the window.

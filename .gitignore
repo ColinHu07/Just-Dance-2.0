@@ -36,9 +36,10 @@ outputs/*
 !outputs/.gitkeep
 temp/*
 !temp/.gitkeep
+app/assets/*.mp4
 
 # Local dance library (saved dances + copied videos)
-dance_library/
+/dance_library/
 
 # OS
 .DS_Store

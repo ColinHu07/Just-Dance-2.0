@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from app import video_utils
+from app.calibration import scan_video_calibration
 from app.comparison_types import ComparisonResult, PoseSequence
 from app.pose_sequence_extract import extract_pose_sequence_from_video
 from app.pose_mirror import mirror_pose_sequence
@@ -50,6 +51,49 @@ class ExtractSequenceWorker(QThread):
         except Exception as e:
             logger.exception("Extract sequence failed")
             self.failed.emit(f"Pose extraction failed: {e}")
+
+
+class CalibrationScanWorker(QThread):
+    progress = Signal(int, str)
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        video_path: str,
+        *,
+        label: str = "video",
+        expected_people: int = 1,
+    ) -> None:
+        super().__init__()
+        self._path = video_path
+        self._label = label
+        self._expected_people = expected_people
+
+    def run(self) -> None:
+        try:
+            video_utils.ensure_app_dirs()
+
+            def cb(pct: int, msg: str) -> None:
+                self.progress.emit(pct, f"[{self._label}] {msg}")
+
+            report = scan_video_calibration(
+                self._path,
+                expected_people=self._expected_people,
+                progress_cb=cb,
+                cancel_check=self.isInterruptionRequested,
+            )
+            self.finished_ok.emit(report)
+        except RuntimeError as e:
+            if "Cancelled" in str(e):
+                self.failed.emit("Cancelled.")
+            else:
+                self.failed.emit(str(e))
+        except video_utils.VideoOpenError as e:
+            self.failed.emit(str(e))
+        except Exception as e:
+            logger.exception("Calibration scan failed")
+            self.failed.emit(f"Calibration scan failed: {e}")
 
 
 class CompareSequencesWorker(QThread):

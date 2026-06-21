@@ -8,6 +8,7 @@ import pytest
 from app import comparison_view
 from app.comparison_types import PoseFrame, PoseSequence
 from app.scoring import compare_pose_sequences
+from app.sequence_features import build_frame_features
 
 
 def _base_norm_xy() -> np.ndarray:
@@ -59,6 +60,14 @@ def test_identical_sequences_score_near_perfect() -> None:
     assert r.breakdown.arms >= 95.0
 
 
+def test_feedback_uses_supportive_coach_language() -> None:
+    a = _seq("a", 18)
+    r = compare_pose_sequences(a, a)
+    text = " ".join(r.explanation_lines)
+    assert "bright spot" in text
+    assert "Timing felt locked in" in text
+
+
 def test_warped_arm_scores_lower_than_identical() -> None:
     ref = _seq("ref", 18)
     bad = _seq("bad", 18, warp_right_arm=True)
@@ -97,3 +106,75 @@ def test_blend_overlay_preserves_shape() -> None:
     usr[:, :] = (0, 255, 0)
     out = comparison_view.blend_overlay_bgr(ref, usr, user_alpha=0.4)
     assert out.shape == ref.shape
+
+
+def test_low_confidence_reference_joint_features_are_inactive() -> None:
+    xy = _base_norm_xy()
+    rel = np.ones(33, dtype=np.float64) * 0.95
+    rel[15] = 0.4
+    frame = PoseFrame(0, 0.0, 640, 480, None, xy, rel)
+
+    feats = build_frame_features(frame)
+
+    wrist_dependent_slots = [0, 13, 14, 33, 35, 39]
+    assert np.all(feats.dim_weight[wrist_dependent_slots] == 0.0)
+    assert np.isnan(feats.vector[0])
+
+
+def test_user_extra_joint_gets_visibility_penalty_when_reference_lacks_it() -> None:
+    rel_ref = np.ones(33, dtype=np.float64) * 0.95
+    rel_ref[15] = 0.0
+    rel_user = np.ones(33, dtype=np.float64) * 0.95
+
+    ref_frames: list[PoseFrame] = []
+    user_frames: list[PoseFrame] = []
+    for k in range(12):
+        ref_xy = _base_norm_xy()
+        user_xy = _base_norm_xy()
+        user_xy[15] += (4.0, -3.0)
+        ref_frames.append(
+            PoseFrame(k, k / 30.0, 640, 480, None, ref_xy, rel_ref.copy())
+        )
+        user_frames.append(
+            PoseFrame(k, k / 30.0, 640, 480, None, user_xy, rel_user.copy())
+        )
+
+    ref = PoseSequence("ref", 30.0, ref_frames, 640, 480)
+    user = PoseSequence("user", 30.0, user_frames, 640, 480)
+    result = compare_pose_sequences(ref, user)
+
+    assert 95.0 <= result.overall_score < 99.0
+    assert any("extra visible limbs" in line for line in result.explanation_lines)
+
+
+def test_user_extra_visible_leg_penalizes_leg_breakdown() -> None:
+    rel_ref = np.ones(33, dtype=np.float64) * 0.95
+    rel_ref[26] = 0.0
+    rel_ref[28] = 0.0
+    rel_user = np.ones(33, dtype=np.float64) * 0.95
+
+    ref = PoseSequence(
+        "ref",
+        30.0,
+        [
+            PoseFrame(k, k / 30.0, 640, 480, None, _base_norm_xy(), rel_ref.copy())
+            for k in range(12)
+        ],
+        640,
+        480,
+    )
+    user = PoseSequence(
+        "user",
+        30.0,
+        [
+            PoseFrame(k, k / 30.0, 640, 480, None, _base_norm_xy(), rel_user.copy())
+            for k in range(12)
+        ],
+        640,
+        480,
+    )
+
+    result = compare_pose_sequences(ref, user)
+
+    assert result.overall_score < 98.0
+    assert result.breakdown.legs < 98.0

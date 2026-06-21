@@ -57,6 +57,8 @@ class FrameFeatures:
     dim_weight: np.ndarray
     # Group masks into vector slices (name -> bool mask).
     group_masks: dict[str, np.ndarray] = field(default_factory=dict)
+    # Raw per-landmark source confidence, used for visibility/silhouette mismatch checks.
+    joint_reliability: Optional[np.ndarray] = None
 
 
 @dataclass

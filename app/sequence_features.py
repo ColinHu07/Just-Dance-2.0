@@ -23,8 +23,8 @@ from app.normalization import (
     _RIGHT_WRIST,
 )
 
-_REL_GATE = 0.35
-"""Below this joint reliability, treat geometry as unknown for that joint."""
+_REL_GATE = 0.55
+"""Below this source-joint reliability, treat geometry as unknown for scoring."""
 
 
 def _min_rel(rel: np.ndarray, *indices: int) -> float:
@@ -294,6 +294,7 @@ def build_frame_features(frame: PoseFrame) -> FrameFeatures:
         vector=v,
         dim_weight=wv,
         group_masks=masks,
+        joint_reliability=np.array(frame.reliability, dtype=np.float64, copy=True),
     )
 
 

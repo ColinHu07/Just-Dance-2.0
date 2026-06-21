@@ -25,6 +25,16 @@ _TIMING_LAG_SENSITIVITY = 2.8  # larger → timing score drops faster with norma
 # Tiny prior so DTW prefers advancing both clips together when pose costs tie (same pose, different lengths).
 _LAMBDA_DTW_TIME_SYNC = 0.42
 
+# Visibility/silhouette mismatch: geometry only compares shared confident joints,
+# but persistent extra/missing visible limbs still count as a small pose mismatch.
+_VIS_HIDDEN_GATE = 0.35
+_VIS_VISIBLE_GATE = 0.70
+_VIS_MISMATCH_PENALTY_SCALE = 16.0
+_VIS_MISMATCH_MAX_PENALTY = 10.0
+_VIS_ARM_JOINTS = (13, 15, 14, 16)  # elbows/wrists
+_VIS_LEG_JOINTS = (25, 27, 26, 28)  # knees/ankles
+_VIS_COMPARE_JOINTS = _VIS_ARM_JOINTS + _VIS_LEG_JOINTS
+
 assert abs(WEIGHT_ANGLES + WEIGHT_DIRECTIONS + WEIGHT_DISTANCES + WEIGHT_POSTURE - 1.0) < 1e-6
 
 
@@ -146,6 +156,77 @@ def frame_dissimilarity(a: FrameFeatures, b: FrameFeatures) -> float:
     """DTW local cost: ``100 - combined_similarity`` (0 = identical pose features)."""
     *_, comb = frame_similarity_parts(a, b)
     return max(0.0, min(100.0, 100.0 - comb))
+
+
+def _visibility_mismatch_ratios(
+    a: FrameFeatures,
+    b: FrameFeatures,
+    joints: Tuple[int, ...],
+) -> Tuple[float, float, float]:
+    """
+    Return (any_mismatch, user_extra_visible, user_missing_visible) ratios.
+
+    Geometry features already require both clips to have source confidence. This
+    separate pass catches persistent silhouette mismatches where one clip clearly
+    shows a limb that the other clip does not.
+    """
+    ra = a.joint_reliability
+    rb = b.joint_reliability
+    if ra is None or rb is None or not joints:
+        return 0.0, 0.0, 0.0
+
+    total = 0
+    mismatch = 0
+    user_extra = 0
+    user_missing = 0
+    for idx in joints:
+        if idx >= len(ra) or idx >= len(rb):
+            continue
+        total += 1
+        ref_rel = float(ra[idx])
+        user_rel = float(rb[idx])
+        ref_hidden_user_visible = (
+            ref_rel < _VIS_HIDDEN_GATE and user_rel >= _VIS_VISIBLE_GATE
+        )
+        ref_visible_user_hidden = (
+            ref_rel >= _VIS_VISIBLE_GATE and user_rel < _VIS_HIDDEN_GATE
+        )
+        if ref_hidden_user_visible:
+            mismatch += 1
+            user_extra += 1
+        elif ref_visible_user_hidden:
+            mismatch += 1
+            user_missing += 1
+
+    if total == 0:
+        return 0.0, 0.0, 0.0
+    return mismatch / total, user_extra / total, user_missing / total
+
+
+def _visibility_penalty_from_ratio(ratio: float) -> float:
+    return min(_VIS_MISMATCH_MAX_PENALTY, ratio * _VIS_MISMATCH_PENALTY_SCALE)
+
+
+def _mean_visibility_mismatch_ratios(
+    path: np.ndarray,
+    feats_r: List[FrameFeatures],
+    feats_u: List[FrameFeatures],
+    joints: Tuple[int, ...],
+) -> Tuple[float, float, float]:
+    if path.shape[0] == 0:
+        return 0.0, 0.0, 0.0
+    total_m = 0.0
+    total_extra = 0.0
+    total_missing = 0.0
+    for t in range(path.shape[0]):
+        i = int(path[t, 0])
+        j = int(path[t, 1])
+        m, extra, missing = _visibility_mismatch_ratios(feats_r[i], feats_u[j], joints)
+        total_m += m
+        total_extra += extra
+        total_missing += missing
+    n = float(path.shape[0])
+    return total_m / n, total_extra / n, total_missing / n
 
 
 def _make_dtw_local_cost(
@@ -281,6 +362,9 @@ def _build_explanation(
     legs: float,
     torso: float,
     timing: float,
+    visibility_penalty: float = 0.0,
+    user_extra_ratio: float = 0.0,
+    user_missing_ratio: float = 0.0,
 ) -> List[str]:
     lines: List[str] = []
     ml, mr = _left_right_arm_masks()
@@ -288,21 +372,60 @@ def _build_explanation(
     sr = _region_similarity_path(path, feats_r, feats_u, mr)
     if math.isfinite(sl) and math.isfinite(sr):
         if sr < sl - 4.0:
-            lines.append("Right arm alignment was weaker than the left arm.")
+            lines.append(
+                "Nice left-side control. The right arm drifted a bit more, "
+                "so give that side a sharper finish on the hits."
+            )
         elif sl < sr - 4.0:
-            lines.append("Left arm alignment was weaker than the right arm.")
+            lines.append(
+                "Your right-side shapes are reading cleaner. Bring the left arm "
+                "through with the same intention and the score should climb."
+            )
     if math.isfinite(legs) and legs >= 78.0:
-        lines.append("Leg movements matched closely overall.")
+        lines.append(
+            "Footwork is a bright spot: your leg shapes matched the reference closely overall."
+        )
     elif math.isfinite(legs) and legs < 60.0:
-        lines.append("Leg movements differed noticeably from the reference.")
+        lines.append(
+            "The groove is there, but the lower-body shapes need the next polish pass. "
+            "Recheck knee and foot placement on the bigger transitions."
+        )
+    if math.isfinite(torso) and torso >= 88.0:
+        lines.append(
+            "Your posture stayed clean, which makes the whole run easier to read."
+        )
     if math.isfinite(torso) and torso < 62.0:
-        lines.append("Torso and posture alignment had room to improve.")
+        lines.append(
+            "Keep the energy, then clean up the frame: torso and posture are the main places to square up."
+        )
     if math.isfinite(timing) and timing < 68.0:
-        lines.append("Timing alignment suggests the dance was often early or late vs. the reference.")
+        lines.append(
+            "The moves are recognizable; the biggest unlock is timing. "
+            "Count into the first beat and try landing each accent a touch closer to the reference."
+        )
     elif math.isfinite(timing) and timing >= 85.0:
-        lines.append("Timing alignment with the reference was strong after warping.")
+        lines.append(
+            "Timing felt locked in; your rhythm stayed strong against the reference."
+        )
+    if visibility_penalty >= 2.0:
+        if user_extra_ratio > user_missing_ratio * 1.25:
+            lines.append(
+                "Tracking note: your video had extra visible limbs where the reference hid them, "
+                "so part of this penalty may be camera angle or occlusion rather than performance."
+            )
+        elif user_missing_ratio > user_extra_ratio * 1.25:
+            lines.append(
+                "Tracking note: the reference showed limbs that your clip did not track consistently. "
+                "Keep hands and feet fully in frame when you can."
+            )
+        else:
+            lines.append(
+                "Tracking note: limb visibility changed between the two clips, so treat that part of the score lightly."
+            )
     if not lines:
-        lines.append("Overall motion was broadly comparable; see category scores for detail.")
+        lines.append(
+            "Solid run. The motion reads close overall; use the category scores to choose the next tiny polish point."
+        )
     return lines
 
 
@@ -343,8 +466,12 @@ def compare_feature_sequences(
         i = int(path[t, 0])
         j = int(path[t, 1])
         *_, comb = frame_similarity_parts(feats_r[i], feats_u[j])
-        per_frame_sim[t] = comb
-        sim_sum += comb
+        vis_ratio, _, _ = _visibility_mismatch_ratios(
+            feats_r[i], feats_u[j], _VIS_COMPARE_JOINTS
+        )
+        adjusted = max(0.0, comb - _visibility_penalty_from_ratio(vis_ratio))
+        per_frame_sim[t] = adjusted
+        sim_sum += adjusted
     overall = float(sim_sum / k) if k > 0 else 0.0
 
     g = feats_r[0].group_masks
@@ -356,6 +483,19 @@ def compare_feature_sequences(
     arms = _region_similarity_path(path, feats_r, feats_u, g.get("arms", np.zeros(FEATURE_DIM, dtype=bool)))
     legs = _region_similarity_path(path, feats_r, feats_u, g.get("legs", np.zeros(FEATURE_DIM, dtype=bool)))
     torso = _region_similarity_path(path, feats_r, feats_u, g.get("torso", np.zeros(FEATURE_DIM, dtype=bool)))
+    visibility_ratio, user_extra_ratio, user_missing_ratio = _mean_visibility_mismatch_ratios(
+        path, feats_r, feats_u, _VIS_COMPARE_JOINTS
+    )
+    arm_visibility_ratio, _, _ = _mean_visibility_mismatch_ratios(
+        path, feats_r, feats_u, _VIS_ARM_JOINTS
+    )
+    leg_visibility_ratio, _, _ = _mean_visibility_mismatch_ratios(
+        path, feats_r, feats_u, _VIS_LEG_JOINTS
+    )
+    if math.isfinite(arms):
+        arms = max(0.0, arms - _visibility_penalty_from_ratio(arm_visibility_ratio))
+    if math.isfinite(legs):
+        legs = max(0.0, legs - _visibility_penalty_from_ratio(leg_visibility_ratio))
 
     timing, _mean_norm_lag, mean_frame_lag = _timing_score_from_path(
         path, max(n_r, 1), max(n_u, 1)
@@ -375,7 +515,18 @@ def compare_feature_sequences(
         relative_distances=nan_to_num(sim_dist, overall),
     )
 
-    expl = _build_explanation(path, feats_r, feats_u, bd.arms, bd.legs, bd.torso_posture, timing)
+    expl = _build_explanation(
+        path,
+        feats_r,
+        feats_u,
+        bd.arms,
+        bd.legs,
+        bd.torso_posture,
+        timing,
+        _visibility_penalty_from_ratio(visibility_ratio),
+        user_extra_ratio,
+        user_missing_ratio,
+    )
 
     return ComparisonResult(
         overall_score=overall,

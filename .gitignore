@@ -37,6 +37,7 @@ outputs/*
 temp/*
 !temp/.gitkeep
 app/assets/*.mp4
+!app/assets/frontend-dance-bg.mp4
 
 # Local dance library (saved dances + copied videos)
 /dance_library/

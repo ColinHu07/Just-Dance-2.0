@@ -60,6 +60,23 @@ QWidget#FrontendLoadingOverlay {
     border-radius: 8px;
 }
 
+QWidget#FrontendCountdownOverlay {
+    background: rgba(2, 3, 8, 220);
+    border-radius: 8px;
+}
+
+QLabel#FrontendCountdownNumber {
+    color: #fff8ff;
+    font-size: 190px;
+    font-weight: 900;
+}
+
+QLabel#FrontendCountdownCaption {
+    color: #70f5dd;
+    font-size: 24px;
+    font-weight: 900;
+}
+
 QLabel#FrontendLoadingTitle {
     color: #fff8ff;
     font-size: 38px;
@@ -88,6 +105,15 @@ QProgressBar#FrontendLoadingProgress::chunk {
 QWidget#FrontendContent {
     background: rgba(0, 0, 0, 78);
     border-radius: 8px;
+}
+
+QWidget#FrontendContent[flow="select"] {
+    background: rgba(0, 0, 0, 78);
+}
+
+QWidget#FrontendContent[flow="play"] {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0a0e16, stop:0.48 #171124, stop:1 #062d2d);
+    border: 1px solid rgba(104, 234, 216, 72);
 }
 
 QWidget#GameBox {
@@ -150,7 +176,7 @@ QLabel#FrontendStage {
     color: rgba(255, 255, 255, 202);
     border: 1px solid rgba(255, 255, 255, 46);
     border-radius: 8px;
-    padding: 14px;
+    padding: 0;
     font-size: 18px;
     font-weight: 800;
 }
@@ -309,9 +335,19 @@ QWidget#FrontendPage {
 
 QWidget#FrontendGameShell,
 QWidget#DanceSelector,
-QWidget#PlayPanel,
 QWidget#DanceCardsHost {
     background: transparent;
+}
+
+QWidget#PlayPanel {
+    background: rgba(10, 7, 24, 128);
+    border: 1px solid rgba(255, 255, 255, 82);
+    border-radius: 8px;
+}
+
+QWidget#PlayPanel[flow="play"] {
+    background: rgba(6, 7, 18, 196);
+    border: 1px solid rgba(104, 234, 216, 120);
 }
 
 QLabel#FrontendKicker {
@@ -337,9 +373,31 @@ QLabel#FrontendReadyBadge {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #ff4fd8, stop:0.52 #a85bff, stop:1 #63f0dc);
     border: 2px solid rgba(255, 255, 255, 180);
     border-radius: 8px;
-    padding: 13px 22px;
-    font-size: 26px;
+    padding: 10px 18px;
+    font-size: 22px;
     font-weight: 900;
+}
+
+QPushButton#FrontendMuteButton {
+    color: #ffffff;
+    background: rgba(13, 10, 28, 152);
+    border: 2px solid rgba(255, 255, 255, 170);
+    border-radius: 8px;
+    padding: 0;
+    font-size: 20px;
+    font-weight: 900;
+}
+
+QPushButton#FrontendMuteButton:hover {
+    background: rgba(255, 255, 255, 218);
+    color: #4d258d;
+    border-color: #ff92db;
+}
+
+QPushButton#FrontendMuteButton:checked {
+    color: #ffffff;
+    background: #242338;
+    border-color: #ffd8fb;
 }
 
 QLabel#FrontendPanelTitle,
@@ -392,8 +450,8 @@ QPushButton#CompanyTab {
     background: rgba(255, 255, 255, 228);
     border: 2px solid rgba(255, 220, 255, 190);
     border-radius: 8px;
-    padding: 10px 14px;
-    min-width: 78px;
+    padding: 8px 12px;
+    min-width: 72px;
     font-size: 14px;
     font-weight: 900;
 }
@@ -455,7 +513,7 @@ QPushButton#DanceCard {
     background: rgba(255, 255, 255, 236);
     border: 2px solid rgba(255, 255, 255, 160);
     border-radius: 8px;
-    padding: 12px;
+    padding: 14px 16px;
     font-size: 14px;
     font-weight: 900;
     text-align: left;
@@ -503,12 +561,56 @@ QLabel#FrontendStatus {
     font-weight: 800;
 }
 
+QLabel#FrontendInstructions {
+    color: rgba(255, 255, 255, 232);
+    background: rgba(9, 7, 20, 118);
+    border: 1px solid rgba(255, 255, 255, 72);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+    font-weight: 800;
+}
+
+QWidget#FrontendResultsPanel {
+    background: rgba(255, 255, 255, 226);
+    border: 2px solid rgba(112, 245, 221, 180);
+    border-radius: 8px;
+}
+
+QLabel#FrontendResultsTitle {
+    color: #5d2fa6;
+    font-size: 16px;
+    font-weight: 900;
+}
+
+QLabel#FrontendResultsScore {
+    color: #11151a;
+    font-size: 34px;
+    font-weight: 900;
+}
+
+QLabel#FrontendResultsDetails {
+    color: #252235;
+    font-size: 13px;
+    font-weight: 800;
+}
+
 QLabel#FrontendStage {
     background: rgba(9, 7, 20, 150);
     color: rgba(255, 255, 255, 226);
     border: 2px solid rgba(255, 255, 255, 82);
     border-radius: 8px;
-    padding: 10px;
+    padding: 0;
+    font-size: 18px;
+    font-weight: 900;
+}
+
+QLabel#FrontendCameraPreview {
+    background: rgba(9, 7, 20, 150);
+    color: rgba(255, 255, 255, 226);
+    border: 2px solid rgba(104, 234, 216, 130);
+    border-radius: 8px;
+    padding: 0;
     font-size: 18px;
     font-weight: 900;
 }
@@ -518,7 +620,7 @@ QPushButton#FrontendActionButton {
     background: rgba(255, 255, 255, 226);
     border: 2px solid rgba(255, 210, 255, 185);
     border-radius: 8px;
-    padding: 12px 15px;
+    padding: 10px 13px;
     font-weight: 900;
 }
 
@@ -533,8 +635,8 @@ QPushButton#FrontendStartButton {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff3fbf, stop:0.58 #9d56ff, stop:1 #57e9d7);
     border: 2px solid rgba(255, 255, 255, 195);
     border-radius: 8px;
-    padding: 12px 20px;
-    font-size: 18px;
+    padding: 10px 18px;
+    font-size: 17px;
     font-weight: 900;
 }
 

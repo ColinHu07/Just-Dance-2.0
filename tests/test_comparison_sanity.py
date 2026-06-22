@@ -52,6 +52,39 @@ def _seq(name: str, n: int, *, warp_right_arm: bool = False, stride: int = 1) ->
     return PoseSequence(name, 30.0, frames, 640, 480)
 
 
+def _moving_seq(name: str, n: int, *, static: bool = False) -> PoseSequence:
+    rel = np.ones(33, dtype=np.float64) * 0.95
+    frames: list[PoseFrame] = []
+    for k in range(n):
+        xy = _base_norm_xy().copy()
+        if not static:
+            phase = k / max(1, n - 1)
+            wave = np.sin(phase * np.pi * 2.0)
+            hit = np.sin(phase * np.pi * 4.0)
+            xy[13] += (-0.15 * wave, -0.45 * abs(wave))
+            xy[15] += (-0.25 * wave, -0.75 * abs(wave))
+            xy[14] += (0.12 * wave, -0.25 * hit)
+            xy[16] += (0.35 * wave, -0.55 * hit)
+            xy[25] += (-0.18 * hit, -0.10 * wave)
+            xy[27] += (-0.28 * hit, -0.18 * wave)
+            xy[26] += (0.22 * wave, 0.20 * abs(hit))
+            xy[28] += (0.34 * wave, 0.30 * abs(hit))
+            xy[11] += (0.05 * wave, -0.08 * hit)
+            xy[12] += (0.05 * wave, -0.08 * hit)
+        frames.append(
+            PoseFrame(
+                frame_index=k,
+                time_sec=k / 30.0,
+                image_width=640,
+                image_height=480,
+                landmarks_raw=None,
+                joints_norm_xy=xy,
+                reliability=rel.copy(),
+            )
+        )
+    return PoseSequence(name, 30.0, frames, 640, 480)
+
+
 def test_identical_sequences_score_near_perfect() -> None:
     a = _seq("a", 18)
     b = _seq("b", 18)
@@ -74,6 +107,16 @@ def test_warped_arm_scores_lower_than_identical() -> None:
     good = compare_pose_sequences(ref, ref)
     worse = compare_pose_sequences(ref, bad)
     assert worse.overall_score < good.overall_score - 2.0
+
+
+def test_static_user_does_not_get_high_score_against_moving_reference() -> None:
+    ref = _moving_seq("ref", 28)
+    static_user = _moving_seq("static", 28, static=True)
+
+    result = compare_pose_sequences(ref, static_user)
+
+    assert result.overall_score < 65.0
+    assert result.breakdown.movement < 70.0
 
 
 def test_temporal_stretch_still_high_similarity() -> None:

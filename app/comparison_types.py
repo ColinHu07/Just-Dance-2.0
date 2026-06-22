@@ -73,6 +73,7 @@ class ScoreBreakdown:
     joint_angles: float
     limb_directions: float
     relative_distances: float
+    movement: float = 100.0
 
 
 @dataclass
@@ -100,6 +101,7 @@ class ComparisonResult:
                 "joint_angles": float(self.breakdown.joint_angles),
                 "limb_directions": float(self.breakdown.limb_directions),
                 "relative_distances": float(self.breakdown.relative_distances),
+                "movement": float(self.breakdown.movement),
             },
             "explanation_lines": list(self.explanation_lines),
             "per_frame_similarity": self.per_frame_similarity.astype(float).tolist(),

@@ -86,6 +86,46 @@ def media_file_has_audio_stream(path: str) -> bool:
         return False
 
 
+def extract_audio_to_mp3(video_path: str, output_path: str) -> tuple[bool, str]:
+    """Extract a video's first audio stream to MP3 for challenge playback."""
+    source = Path(video_path).resolve()
+    out = Path(output_path).resolve()
+    if not source.is_file():
+        return False, "Reference video missing; cannot extract challenge audio."
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        return False, "ffmpeg was not found; challenge will play without source audio."
+    if not media_file_has_audio_stream(str(source)):
+        return False, "Reference video has no audio stream."
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-y",
+        "-i",
+        str(source),
+        "-vn",
+        "-map",
+        "0:a:0",
+        "-acodec",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        str(out),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"Audio extraction failed: {e}"
+    if r.returncode != 0 or not out.is_file() or out.stat().st_size <= 0:
+        err = (r.stderr or r.stdout or "unknown ffmpeg error").strip()
+        return False, f"Audio extraction failed: {err[:300]}"
+    return True, str(out)
+
+
 def _build_final_mux_path(silent_processed: Path) -> Path:
     """Place muxed file next to the silent file; keep container suffix for stream copy."""
     return silent_processed.parent / f"{silent_processed.stem}_with_audio{silent_processed.suffix}"

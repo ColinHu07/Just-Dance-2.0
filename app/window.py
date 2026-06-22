@@ -10,17 +10,21 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl
-from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QPixmap
+from PySide6.QtGui import QColor, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QPainter, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -38,10 +42,15 @@ from PySide6.QtWidgets import (
 from app import comparison_view
 from app.calibration import CalibrationReport
 from app.dance_library import (
+    append_score_record,
+    best_score_for_dance,
     delete_dance,
     list_dances,
     load_dance,
+    load_dance_metadata,
+    load_score_history,
     save_dance_from_reference,
+    update_dance_metadata,
 )
 from app import pose_utils
 from app import ui_utils
@@ -53,6 +62,7 @@ from app.comparison_worker import (
     ExtractSequenceWorker,
     save_comparison_json,
 )
+from app.ffmpeg_audio import extract_audio_to_mp3
 from app.style import APP_STYLESHEET
 from app.worker import ProcessVideoWorker
 
@@ -108,6 +118,50 @@ FRONTEND_ARTIST_COMPANIES = {
 }
 
 
+class AspectPreviewLabel(QLabel):
+    """QLabel that always repaints a video frame as contained/letterboxed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._bgr = None
+        self._empty_text = ""
+
+    def set_bgr_frame(self, bgr, empty_text: str) -> None:
+        self._bgr = bgr.copy() if bgr is not None else None
+        self._empty_text = empty_text
+        self._render_frame()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._bgr is not None:
+            self._render_frame()
+
+    def _render_frame(self) -> None:
+        if self._bgr is None:
+            self.clear()
+            self.setText(self._empty_text)
+            return
+        pm = ui_utils.bgr_to_qpixmap(self._bgr)
+        rect = self.contentsRect()
+        if pm.isNull() or rect.width() < 20 or rect.height() < 20:
+            return
+        scaled = pm.scaled(
+            rect.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        canvas = QPixmap(self.size())
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        x = rect.x() + (rect.width() - scaled.width()) // 2
+        y = rect.y() + (rect.height() - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
+        painter.end()
+        self.setPixmap(canvas)
+        self.setText("")
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -139,6 +193,8 @@ class MainWindow(QMainWindow):
         self._ref_sequence: PoseSequence | None = None
         self._user_sequence: PoseSequence | None = None
         self._last_comparison: ComparisonResult | None = None
+        self._last_scored_ref_sequence: PoseSequence | None = None
+        self._last_scored_user_sequence: PoseSequence | None = None
         self._ref_calibration: CalibrationReport | None = None
         self._user_calibration: CalibrationReport | None = None
         self._frontend_calibration: CalibrationReport | None = None
@@ -167,6 +223,8 @@ class MainWindow(QMainWindow):
         self._ref_practice_started_at: float = 0.0
         self._ref_practice_last_frame_index: int = -1
         self._ref_practice_total_frames: int = 0
+        self._ref_practice_loop: bool = True
+        self._ref_practice_challenge: bool = False
         self._frontend_backdrop_cap: cv2.VideoCapture | None = None
         self._frontend_backdrop_timer: QTimer | None = None
         self._frontend_backdrop_bgr = None
@@ -179,6 +237,22 @@ class MainWindow(QMainWindow):
         self._frontend_audio_output: QAudioOutput | None = None
         self._frontend_music_player: QMediaPlayer | None = None
         self._frontend_music_should_play: bool = False
+        self._frontend_music_muted: bool = False
+        self._frontend_flow_stage: str = "select"
+        self._frontend_countdown_timer: QTimer | None = None
+        self._frontend_countdown_value: int = 3
+        self._frontend_grading_timer: QTimer | None = None
+        self._frontend_camera_cap: cv2.VideoCapture | None = None
+        self._frontend_camera_timer: QTimer | None = None
+        self._frontend_record_writer: cv2.VideoWriter | None = None
+        self._frontend_record_path: str | None = None
+        self._frontend_record_size: tuple[int, int] | None = None
+        self._frontend_record_frame_count: int = 0
+        self._frontend_pending_compare_after_extract: bool = False
+        self._frontend_scoring_active: bool = False
+        self._challenge_audio_output: QAudioOutput | None = None
+        self._challenge_audio_player: QMediaPlayer | None = None
+        self._challenge_audio_path: str | None = None
         self._frontend_stage_bgr = None
         self._frontend_selected_company: str = "ALL"
         self._frontend_selected_artist: str = "ALL"
@@ -401,10 +475,12 @@ class MainWindow(QMainWindow):
         lib_row1.addWidget(self.library_combo, stretch=1)
         self.btn_save_dance = QPushButton("Save dance")
         self.btn_load_library_dance = QPushButton("Load dance")
+        self.btn_edit_library_dance = QPushButton("Edit details")
         self.btn_delete_library_dance = QPushButton("Delete")
         self.btn_delete_library_dance.setProperty("variant", "danger")
         lib_row1.addWidget(self.btn_save_dance)
         lib_row1.addWidget(self.btn_load_library_dance)
+        lib_row1.addWidget(self.btn_edit_library_dance)
         lib_row1.addWidget(self.btn_delete_library_dance)
         lib_layout.addLayout(lib_row1)
         lib_row2 = QHBoxLayout()
@@ -495,6 +571,41 @@ class MainWindow(QMainWindow):
         self.user_calibration_label.setWordWrap(True)
         compare_layout.addWidget(self.user_calibration_label)
 
+        trim_box = QGroupBox("Scoring trim window")
+        trim_box.setObjectName("TrimBox")
+        trim_layout = QGridLayout(trim_box)
+        trim_layout.setHorizontalSpacing(10)
+        trim_layout.setVerticalSpacing(8)
+        trim_layout.addWidget(QLabel("Clip"), 0, 0)
+        trim_layout.addWidget(QLabel("Start"), 0, 1)
+        trim_layout.addWidget(QLabel("Stop"), 0, 2)
+        self.ref_trim_start_spin = self._make_trim_spinbox()
+        self.ref_trim_end_spin = self._make_trim_spinbox()
+        self.user_trim_start_spin = self._make_trim_spinbox()
+        self.user_trim_end_spin = self._make_trim_spinbox()
+        for spin in (
+            self.ref_trim_start_spin,
+            self.ref_trim_end_spin,
+            self.user_trim_start_spin,
+            self.user_trim_end_spin,
+        ):
+            spin.valueChanged.connect(lambda _value: self._refresh_trim_status())
+        trim_layout.addWidget(QLabel("Reference"), 1, 0)
+        trim_layout.addWidget(self.ref_trim_start_spin, 1, 1)
+        trim_layout.addWidget(self.ref_trim_end_spin, 1, 2)
+        trim_layout.addWidget(QLabel("Performance"), 2, 0)
+        trim_layout.addWidget(self.user_trim_start_spin, 2, 1)
+        trim_layout.addWidget(self.user_trim_end_spin, 2, 2)
+        self.btn_trim_full = QPushButton("Use full clips")
+        self.btn_trim_full.setProperty("variant", "compact")
+        self.btn_trim_full.clicked.connect(self._on_trim_full_clicked)
+        trim_layout.addWidget(self.btn_trim_full, 1, 3, 2, 1)
+        self.trim_status_label = QLabel("Set the scoring window after loading videos. Stop defaults to each clip length.")
+        self.trim_status_label.setObjectName("MutedLabel")
+        self.trim_status_label.setWordWrap(True)
+        trim_layout.addWidget(self.trim_status_label, 3, 0, 1, 4)
+        compare_layout.addWidget(trim_box)
+
         cmp_row = QHBoxLayout()
         self.btn_load_ref = QPushButton("Load reference")
         self.btn_load_user = QPushButton("Load performance")
@@ -573,6 +684,7 @@ class MainWindow(QMainWindow):
 
         self.btn_save_dance.clicked.connect(self._on_save_dance_clicked)
         self.btn_load_library_dance.clicked.connect(self._on_load_library_dance_clicked)
+        self.btn_edit_library_dance.clicked.connect(self._on_edit_library_dance_clicked)
         self.btn_delete_library_dance.clicked.connect(self._on_delete_library_dance_clicked)
         self.btn_ref_practice_play.clicked.connect(self._on_ref_practice_play_clicked)
         self.mirror_practice_checkbox.stateChanged.connect(self._on_mirror_practice_changed)
@@ -590,7 +702,11 @@ class MainWindow(QMainWindow):
             self._on_frontend_players_changed
         )
         self.btn_frontend_calibrate.clicked.connect(self._on_frontend_calibrate_clicked)
+        self.btn_frontend_preview.clicked.connect(self._on_frontend_preview_clicked)
+        self.btn_frontend_select.clicked.connect(self._on_frontend_select_clicked)
+        self.btn_frontend_back.clicked.connect(self._on_frontend_back_clicked)
         self.btn_frontend_start.clicked.connect(self._on_frontend_start_clicked)
+        self.btn_frontend_mute.clicked.connect(self._on_frontend_mute_clicked)
 
         self._update_playback_speed_label()
 
@@ -621,7 +737,9 @@ class MainWindow(QMainWindow):
         stack.addWidget(self.frontend_backdrop_label)
 
         content = QWidget()
+        self.frontend_content = content
         content.setObjectName("FrontendContent")
+        content.setProperty("flow", "select")
         layout = QVBoxLayout(content)
         layout.setContentsMargins(28, 22, 28, 24)
         layout.setSpacing(14)
@@ -633,13 +751,15 @@ class MainWindow(QMainWindow):
         game_layout.setSpacing(12)
 
         marquee = QHBoxLayout()
-        marquee.setSpacing(18)
+        marquee.setSpacing(10)
         title_stack = QVBoxLayout()
         title_stack.setSpacing(2)
         kicker = QLabel("STAGE SELECT")
+        self.frontend_kicker_label = kicker
         kicker.setObjectName("FrontendKicker")
         title_stack.addWidget(kicker)
         title = QLabel("Choose Your Dance")
+        self.frontend_title_label = title
         title.setObjectName("FrontendTitle")
         title_stack.addWidget(title)
         self.frontend_song_meta_label = QLabel("Pick a company, artist, and saved dance.")
@@ -650,10 +770,18 @@ class MainWindow(QMainWindow):
         self.frontend_ready_badge = QLabel("READY")
         self.frontend_ready_badge.setObjectName("FrontendReadyBadge")
         self.frontend_ready_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.btn_frontend_mute = QPushButton("♪")
+        self.btn_frontend_mute.setObjectName("FrontendMuteButton")
+        self.btn_frontend_mute.setCheckable(True)
+        self.btn_frontend_mute.setToolTip("Mute or unmute the menu music.")
+        self.btn_frontend_mute.setFixedSize(46, 42)
+        marquee.addWidget(self.btn_frontend_mute)
         marquee.addWidget(self.frontend_ready_badge)
         game_layout.addLayout(marquee)
 
-        company_row = QHBoxLayout()
+        self.frontend_company_row_widget = QWidget()
+        company_row = QHBoxLayout(self.frontend_company_row_widget)
+        company_row.setContentsMargins(0, 0, 0, 0)
         company_row.setSpacing(8)
         self._frontend_company_buttons = {}
         for company in FRONTEND_COMPANY_ORDER:
@@ -667,9 +795,10 @@ class MainWindow(QMainWindow):
             self._frontend_company_buttons[company] = btn
             company_row.addWidget(btn)
         company_row.addStretch(1)
-        game_layout.addLayout(company_row)
+        game_layout.addWidget(self.frontend_company_row_widget)
 
         artist_wrap = QWidget()
+        self.frontend_artist_wrap = artist_wrap
         artist_wrap.setObjectName("ArtistStrip")
         artist_wrap_layout = QHBoxLayout(artist_wrap)
         artist_wrap_layout.setContentsMargins(10, 8, 10, 8)
@@ -686,6 +815,7 @@ class MainWindow(QMainWindow):
         middle.setSpacing(14)
 
         selector_panel = QWidget()
+        self.frontend_selector_panel = selector_panel
         selector_panel.setObjectName("DanceSelector")
         selector_layout = QVBoxLayout(selector_panel)
         selector_layout.setContentsMargins(0, 0, 0, 0)
@@ -721,32 +851,95 @@ class MainWindow(QMainWindow):
         middle.addWidget(selector_panel, stretch=3)
 
         play_panel = QWidget()
+        self.frontend_play_panel = play_panel
         play_panel.setObjectName("PlayPanel")
+        play_panel.setProperty("flow", "select")
         play_layout = QVBoxLayout(play_panel)
-        play_layout.setContentsMargins(0, 0, 0, 0)
-        play_layout.setSpacing(10)
+        play_layout.setContentsMargins(12, 12, 12, 12)
+        play_layout.setSpacing(7)
 
         self.frontend_song_title_label = QLabel("Select a dance")
         self.frontend_song_title_label.setObjectName("FrontendSongTitle")
         self.frontend_song_title_label.setWordWrap(True)
         play_layout.addWidget(self.frontend_song_title_label)
 
-        self.frontend_stage_label = QLabel()
+        self.frontend_preview_row_widget = QWidget()
+        preview_row = QHBoxLayout(self.frontend_preview_row_widget)
+        preview_row.setContentsMargins(0, 0, 0, 0)
+        preview_row.setSpacing(4)
+
+        demo_col = QVBoxLayout()
+        demo_col.setContentsMargins(0, 0, 0, 0)
+        demo_col.setSpacing(4)
+        demo_title = QLabel("Demo")
+        demo_title.setObjectName("FrontendControlLabel")
+        demo_col.addWidget(demo_title)
+        self.frontend_stage_label = AspectPreviewLabel()
         self._configure_video_label(
             self.frontend_stage_label,
-            min_height=210,
-            max_height=260,
+            min_height=300,
+            max_height=620,
         )
         self.frontend_stage_label.setObjectName("FrontendStage")
         self.frontend_stage_label.setText("Select a dance")
-        play_layout.addWidget(self.frontend_stage_label)
+        demo_col.addWidget(self.frontend_stage_label, stretch=1)
+        self.frontend_stage_column_widget = QWidget()
+        self.frontend_stage_column_widget.setLayout(demo_col)
+        preview_row.addWidget(self.frontend_stage_column_widget, stretch=0)
+
+        camera_col = QVBoxLayout()
+        camera_col.setContentsMargins(0, 0, 0, 0)
+        camera_col.setSpacing(4)
+        camera_title = QLabel("Camera")
+        camera_title.setObjectName("FrontendControlLabel")
+        camera_col.addWidget(camera_title)
+        self.frontend_camera_label = AspectPreviewLabel()
+        self._configure_video_label(
+            self.frontend_camera_label,
+            min_height=300,
+            max_height=620,
+        )
+        self.frontend_camera_label.setObjectName("FrontendCameraPreview")
+        self.frontend_camera_label.setText("Camera preview")
+        camera_col.addWidget(self.frontend_camera_label, stretch=1)
+        self.frontend_camera_column_widget = QWidget()
+        self.frontend_camera_column_widget.setLayout(camera_col)
+        preview_row.addWidget(self.frontend_camera_column_widget, stretch=1)
+        play_layout.addWidget(self.frontend_preview_row_widget, stretch=1)
 
         self.frontend_status_label = QLabel("Select a saved dance.")
         self.frontend_status_label.setObjectName("FrontendStatus")
         self.frontend_status_label.setWordWrap(True)
         play_layout.addWidget(self.frontend_status_label)
 
-        player_row = QHBoxLayout()
+        self.frontend_ready_instructions = QLabel(
+            "Choose a dance first. You can preview the reference before opening camera setup."
+        )
+        self.frontend_ready_instructions.setObjectName("FrontendInstructions")
+        self.frontend_ready_instructions.setWordWrap(True)
+        play_layout.addWidget(self.frontend_ready_instructions)
+
+        self.frontend_results_panel = QWidget()
+        self.frontend_results_panel.setObjectName("FrontendResultsPanel")
+        results_layout = QVBoxLayout(self.frontend_results_panel)
+        results_layout.setContentsMargins(14, 12, 14, 12)
+        results_layout.setSpacing(6)
+        self.frontend_results_title = QLabel("Results")
+        self.frontend_results_title.setObjectName("FrontendResultsTitle")
+        results_layout.addWidget(self.frontend_results_title)
+        self.frontend_results_score = QLabel("--")
+        self.frontend_results_score.setObjectName("FrontendResultsScore")
+        results_layout.addWidget(self.frontend_results_score)
+        self.frontend_results_details = QLabel("Finish a challenge to see stats.")
+        self.frontend_results_details.setObjectName("FrontendResultsDetails")
+        self.frontend_results_details.setWordWrap(True)
+        results_layout.addWidget(self.frontend_results_details)
+        play_layout.addWidget(self.frontend_results_panel)
+        self.frontend_results_panel.hide()
+
+        self.frontend_player_row_widget = QWidget()
+        player_row = QHBoxLayout(self.frontend_player_row_widget)
+        player_row.setContentsMargins(0, 0, 0, 0)
         player_row.setSpacing(8)
         players_label = QLabel("Players")
         players_label.setObjectName("FrontendControlLabel")
@@ -761,19 +954,28 @@ class MainWindow(QMainWindow):
             self._frontend_player_buttons[n] = btn
             player_row.addWidget(btn)
         player_row.addStretch(1)
-        play_layout.addLayout(player_row)
+        play_layout.addWidget(self.frontend_player_row_widget)
 
         action_row = QHBoxLayout()
         action_row.setSpacing(10)
-        self.btn_frontend_calibrate = QPushButton("Calibrate")
+        self.btn_frontend_select = QPushButton("Select")
+        self.btn_frontend_select.setObjectName("FrontendStartButton")
+        self.btn_frontend_select.setProperty("variant", "primary")
+        self.btn_frontend_back = QPushButton("Back")
+        self.btn_frontend_back.setObjectName("FrontendActionButton")
+        self.btn_frontend_preview = QPushButton("Preview")
+        self.btn_frontend_preview.setObjectName("FrontendActionButton")
+        self.btn_frontend_calibrate = QPushButton("Camera setup")
         self.btn_frontend_calibrate.setObjectName("FrontendActionButton")
         self.btn_frontend_start = QPushButton("Start")
         self.btn_frontend_start.setObjectName("FrontendStartButton")
         self.btn_frontend_start.setProperty("variant", "primary")
+        action_row.addWidget(self.btn_frontend_select)
+        action_row.addWidget(self.btn_frontend_back)
+        action_row.addWidget(self.btn_frontend_preview)
         action_row.addWidget(self.btn_frontend_calibrate)
         action_row.addWidget(self.btn_frontend_start)
         play_layout.addLayout(action_row)
-        play_layout.addStretch(1)
         middle.addWidget(play_panel, stretch=2)
 
         game_layout.addLayout(middle, stretch=1)
@@ -817,6 +1019,23 @@ class MainWindow(QMainWindow):
         stack.addWidget(self.frontend_loading_overlay)
         self.frontend_loading_overlay.hide()
 
+        self.frontend_countdown_overlay = QWidget()
+        self.frontend_countdown_overlay.setObjectName("FrontendCountdownOverlay")
+        countdown_layout = QVBoxLayout(self.frontend_countdown_overlay)
+        countdown_layout.setContentsMargins(28, 28, 28, 28)
+        countdown_layout.addStretch(1)
+        self.frontend_countdown_label = QLabel("3")
+        self.frontend_countdown_label.setObjectName("FrontendCountdownNumber")
+        self.frontend_countdown_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        countdown_layout.addWidget(self.frontend_countdown_label)
+        self.frontend_countdown_caption = QLabel("Get ready")
+        self.frontend_countdown_caption.setObjectName("FrontendCountdownCaption")
+        self.frontend_countdown_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        countdown_layout.addWidget(self.frontend_countdown_caption)
+        countdown_layout.addStretch(1)
+        stack.addWidget(self.frontend_countdown_overlay)
+        self.frontend_countdown_overlay.hide()
+
         stack.setCurrentWidget(content)
         return page
 
@@ -833,7 +1052,17 @@ class MainWindow(QMainWindow):
         label.setMinimumHeight(min_height)
         label.setMaximumHeight(max_height)
         label.setScaledContents(False)
-        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+
+    def _make_trim_spinbox(self) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 9999.0)
+        spin.setDecimals(2)
+        spin.setSingleStep(0.25)
+        spin.setSuffix(" s")
+        spin.setMinimumWidth(92)
+        spin.setToolTip("Only this time range will be scored. The video file is not edited.")
+        return spin
 
     def _set_app_mode(self, mode: str) -> None:
         frontend = mode == "frontend"
@@ -848,8 +1077,17 @@ class MainWindow(QMainWindow):
         if frontend:
             self._resize_frontend_page()
             self._set_frontend_music_enabled(True)
-            self._start_frontend_backdrop_video()
-            self._refresh_frontend_backdrop()
+            if self._frontend_flow_stage == "select":
+                self.frontend_backdrop_label.setVisible(True)
+                self._start_frontend_backdrop_video()
+                self._refresh_frontend_backdrop()
+            else:
+                self._stop_frontend_backdrop_video()
+                self.frontend_backdrop_label.setVisible(False)
+                self._frontend_backdrop_ready = True
+                self._set_frontend_loading(False)
+                if self._frontend_flow_stage != "countdown" and not self._ref_practice_challenge:
+                    self._play_frontend_music_if_ready()
             self._refresh_frontend_stage()
         else:
             self._set_frontend_music_enabled(False)
@@ -861,10 +1099,18 @@ class MainWindow(QMainWindow):
     def _resize_frontend_page(self) -> None:
         if not hasattr(self, "frontend_page"):
             return
+        if self.mode_stack.currentWidget() is not self.frontend_page:
+            self.mode_stack.setMinimumHeight(0)
+            self.mode_stack.setMaximumHeight(16777215)
+            return
         viewport_h = 720
         if hasattr(self, "_scroll_area") and self._scroll_area is not None:
             viewport_h = max(520, self._scroll_area.viewport().height())
-        target_h = max(500, min(760, viewport_h - 190))
+        play_flow = getattr(self, "_frontend_flow_stage", "select") != "select"
+        reserved_h = 80 if play_flow else 160
+        min_h = 760 if play_flow else 560
+        max_h = 1040 if play_flow else 850
+        target_h = max(min_h, min(max_h, viewport_h - reserved_h))
         self.mode_stack.setMinimumHeight(target_h)
         self.mode_stack.setMaximumHeight(target_h)
         self.frontend_page.setMinimumHeight(target_h)
@@ -877,6 +1123,76 @@ class MainWindow(QMainWindow):
             return None
         dance_id = self.frontend_dance_combo.currentData()
         return str(dance_id) if dance_id else None
+
+    def _frontend_best_score_suffix(self, dance_id: str | None = None) -> str:
+        dance_id = dance_id or self._selected_frontend_dance_id()
+        if not dance_id:
+            return ""
+        best = best_score_for_dance(
+            dance_id,
+            player_count=self._frontend_expected_people(),
+        )
+        if best is None:
+            return ""
+        return f" · best {best.score:.0f}%"
+
+    def _set_frontend_flow_stage(self, stage: str) -> None:
+        self._frontend_flow_stage = stage
+        if not hasattr(self, "frontend_ready_badge"):
+            return
+        play_flow = stage != "select"
+        self.frontend_content.setProperty("flow", "play" if play_flow else "select")
+        self.frontend_play_panel.setProperty("flow", "play" if play_flow else "select")
+        for widget in (self.frontend_content, self.frontend_play_panel):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+        if play_flow:
+            self._stop_frontend_backdrop_video()
+            self.frontend_backdrop_label.setVisible(False)
+            self._frontend_backdrop_ready = True
+            self._set_frontend_loading(False)
+            if stage != "countdown" and not self._ref_practice_challenge:
+                self._play_frontend_music_if_ready()
+        else:
+            self.frontend_backdrop_label.setVisible(True)
+            if self.mode_stack.currentWidget() is self.frontend_page:
+                self._start_frontend_backdrop_video()
+                self._refresh_frontend_backdrop()
+        if stage == "select":
+            self.frontend_kicker_label.setText("STAGE SELECT")
+            self.frontend_title_label.setText("Choose Your Dance")
+            self.frontend_ready_badge.setText("SELECT")
+            self.frontend_ready_instructions.setText(
+                "Pick a dance card, then press Select to set up players and preview."
+            )
+        elif stage == "setup":
+            self.frontend_kicker_label.setText("PRACTICE SETUP")
+            self.frontend_title_label.setText(self.frontend_song_title_label.text() or "Practice Setup")
+            self.frontend_ready_badge.setText("SETUP")
+            self.frontend_ready_instructions.setText(
+                "Choose player count and preview the reference as many times as you want."
+            )
+        elif stage == "ready":
+            self.frontend_kicker_label.setText("CAMERA CHECK")
+            self.frontend_title_label.setText(self.frontend_song_title_label.text() or "Camera Check")
+            self.frontend_ready_badge.setText("READY")
+            players = self._frontend_expected_people()
+            noun = "player" if players == 1 else "players"
+            self.frontend_ready_instructions.setText(
+                f"Camera setup: make sure all {players} {noun} are fully visible, spaced apart, "
+                "and not covering each other. Press Start when everyone is ready."
+            )
+        elif stage == "countdown":
+            self.frontend_kicker_label.setText("GET READY")
+            self.frontend_title_label.setText(self.frontend_song_title_label.text() or "Get Ready")
+            self.frontend_ready_badge.setText(str(self._frontend_countdown_value))
+        elif stage == "results":
+            self.frontend_kicker_label.setText("RESULTS")
+            self.frontend_title_label.setText(self.frontend_song_title_label.text() or "Results")
+            self.frontend_ready_badge.setText("SCORE")
+        self._refresh_frontend_controls()
+        self._resize_frontend_page()
+        self._refresh_frontend_stage()
 
     def _frontend_expected_people(self) -> int:
         if not hasattr(self, "frontend_players_combo"):
@@ -892,23 +1208,57 @@ class MainWindow(QMainWindow):
             return
         busy = self._comparison_workers_busy()
         has_dance = self._selected_frontend_dance_id() is not None
+        stage = self._frontend_flow_stage
         running = (
             self._ref_practice_timer is not None
             and self._ref_practice_timer.isActive()
         )
-        self.frontend_dance_combo.setEnabled(not busy and not running)
+        selecting = stage == "select"
+        setup = stage == "setup"
+        ready = stage == "ready"
+        countdown = stage == "countdown"
+        results = stage == "results"
+        self.frontend_dance_combo.setEnabled(not busy and not running and selecting)
         self.frontend_players_combo.setEnabled(not busy and not running)
         for btn in self._frontend_company_buttons.values():
-            btn.setEnabled(not busy and not running)
+            btn.setEnabled(not busy and not running and selecting)
         for btn in self._frontend_artist_buttons.values():
-            btn.setEnabled(not busy and not running)
+            btn.setEnabled(not busy and not running and selecting)
         for btn in self._frontend_dance_card_buttons.values():
-            btn.setEnabled(not busy and not running)
+            btn.setEnabled(not busy and not running and selecting)
         for btn in self._frontend_player_buttons.values():
-            btn.setEnabled(not busy and not running)
-        self.btn_frontend_calibrate.setEnabled(not busy and not running and has_dance)
-        self.btn_frontend_start.setEnabled((not busy and has_dance) or running)
-        self.btn_frontend_start.setText("Stop" if running else "Start")
+            btn.setEnabled(not busy and not running and (setup or ready))
+        details_visible = not selecting
+        self.frontend_company_row_widget.setVisible(selecting)
+        self.frontend_artist_wrap.setVisible(selecting)
+        self.frontend_selector_panel.setVisible(selecting)
+        self.frontend_play_panel.setVisible(True)
+        self.frontend_song_title_label.setVisible(selecting)
+        self.frontend_preview_row_widget.setVisible(details_visible and not results)
+        self.frontend_ready_instructions.setVisible(ready or countdown)
+        self.frontend_results_panel.setVisible(results)
+        self.frontend_player_row_widget.setVisible(details_visible and not results)
+        camera_visible = setup or ready or countdown or self._frontend_camera_cap is not None
+        self.frontend_camera_column_widget.setVisible(camera_visible and not results)
+        for btn in self._frontend_player_buttons.values():
+            btn.setVisible(details_visible)
+        self.btn_frontend_select.setVisible(selecting)
+        self.btn_frontend_select.setEnabled(not busy and has_dance and not running)
+        self.btn_frontend_back.setVisible(not selecting)
+        self.btn_frontend_back.setEnabled(not busy and not running and not countdown)
+        self.btn_frontend_preview.setVisible(setup)
+        self.btn_frontend_preview.setEnabled((not busy and has_dance and setup) or running)
+        self.btn_frontend_preview.setText("Stop preview" if running else "Preview")
+        self.btn_frontend_calibrate.setVisible(setup or ready)
+        self.btn_frontend_calibrate.setEnabled(not busy and not running and has_dance and (setup or ready))
+        self.btn_frontend_start.setVisible(ready or countdown or running or results)
+        self.btn_frontend_start.setEnabled(
+            (not busy and has_dance and (ready or results)) or running or countdown
+        )
+        if results:
+            self.btn_frontend_start.setText("Play again")
+        else:
+            self.btn_frontend_start.setText("Stop" if running else "Start")
 
     def _sync_backend_library_combo_to_frontend(self, dance_id: str | None) -> None:
         if not dance_id:
@@ -920,13 +1270,29 @@ class MainWindow(QMainWindow):
                 self.library_combo.blockSignals(False)
                 return
 
-    def _set_frontend_loading(self, loading: bool, status: str = "Cueing video") -> None:
+    def _set_frontend_loading(
+        self,
+        loading: bool,
+        status: str = "Cueing video",
+        title: str = "Loading stage",
+    ) -> None:
         if not hasattr(self, "frontend_loading_overlay"):
             return
+        self.frontend_loading_title.setText(title)
         self.frontend_loading_status.setText(status)
         self.frontend_loading_overlay.setVisible(loading)
         if loading:
             self.frontend_loading_overlay.raise_()
+
+    def _set_frontend_countdown_overlay(self, visible: bool, text: str = "3") -> None:
+        if not hasattr(self, "frontend_countdown_overlay"):
+            return
+        self.frontend_countdown_label.setText(text)
+        caption = "Dance!" if text == "DANCE" else "Get ready"
+        self.frontend_countdown_caption.setText(caption)
+        self.frontend_countdown_overlay.setVisible(visible)
+        if visible:
+            self.frontend_countdown_overlay.raise_()
 
     def _mark_frontend_backdrop_ready(self) -> None:
         if self._frontend_backdrop_ready:
@@ -940,6 +1306,7 @@ class MainWindow(QMainWindow):
             return
         self._frontend_audio_output = QAudioOutput(self)
         self._frontend_audio_output.setVolume(0.22)
+        self._frontend_audio_output.setMuted(self._frontend_music_muted)
         self._frontend_music_player = QMediaPlayer(self)
         self._frontend_music_player.setAudioOutput(self._frontend_audio_output)
         self._frontend_music_player.setSource(
@@ -952,6 +1319,17 @@ class MainWindow(QMainWindow):
         self._frontend_music_player.mediaStatusChanged.connect(
             self._on_frontend_music_status_changed
         )
+
+    def _apply_frontend_mute_state(self) -> None:
+        if self._frontend_audio_output is not None:
+            self._frontend_audio_output.setMuted(self._frontend_music_muted)
+        if hasattr(self, "btn_frontend_mute"):
+            self.btn_frontend_mute.setChecked(self._frontend_music_muted)
+            self.btn_frontend_mute.setText("×" if self._frontend_music_muted else "♪")
+
+    def _on_frontend_mute_clicked(self, checked: bool) -> None:
+        self._frontend_music_muted = checked
+        self._apply_frontend_mute_state()
 
     def _set_frontend_music_enabled(self, enabled: bool) -> None:
         self._frontend_music_should_play = enabled
@@ -987,13 +1365,109 @@ class MainWindow(QMainWindow):
         ):
             self._play_frontend_music_if_ready()
 
+    def _pause_frontend_music(self) -> None:
+        if self._frontend_music_player is not None:
+            self._frontend_music_player.pause()
+
+    def _resume_frontend_music(self) -> None:
+        if self.mode_stack.currentWidget() is self.frontend_page:
+            self._frontend_music_should_play = True
+            self._play_frontend_music_if_ready()
+
+    def _stop_challenge_audio(self) -> None:
+        if self._challenge_audio_player is not None:
+            self._challenge_audio_player.stop()
+
+    def _challenge_audio_sidecar_path(self) -> str | None:
+        if not self._ref_path:
+            return None
+        ref = Path(self._ref_path)
+        return str(ref.with_name("challenge_audio.mp3"))
+
+    def _ensure_challenge_audio(self) -> str | None:
+        if not self._ref_path:
+            return None
+        target = self._challenge_audio_sidecar_path()
+        if not target:
+            return None
+        target_path = Path(target)
+        if target_path.is_file() and target_path.stat().st_size > 0:
+            self._challenge_audio_path = str(target_path)
+            return self._challenge_audio_path
+        ok, result = extract_audio_to_mp3(self._ref_path, str(target_path))
+        if ok:
+            self._challenge_audio_path = result
+            return result
+        self.frontend_status_label.setText(result)
+        return None
+
+    def _play_challenge_audio(self) -> None:
+        audio_path = self._ensure_challenge_audio()
+        if not audio_path:
+            return
+        if self._challenge_audio_output is None:
+            self._challenge_audio_output = QAudioOutput(self)
+            self._challenge_audio_output.setVolume(0.9)
+        if self._challenge_audio_player is None:
+            self._challenge_audio_player = QMediaPlayer(self)
+            self._challenge_audio_player.setAudioOutput(self._challenge_audio_output)
+        self._challenge_audio_player.stop()
+        self._challenge_audio_player.setSource(QUrl.fromLocalFile(audio_path))
+        try:
+            self._challenge_audio_player.setLoops(1)
+        except Exception:
+            pass
+        self._challenge_audio_player.play()
+
     def _set_frontend_stage_from_bgr(self, bgr, empty_text: str = "Select a dance") -> None:
         self._frontend_stage_bgr = bgr.copy() if bgr is not None else None
         self._refresh_frontend_stage(empty_text)
 
+    def _update_frontend_stage_geometry(self) -> None:
+        if not hasattr(self, "frontend_stage_label"):
+            return
+        unlimited = 16777215
+        if self._frontend_stage_bgr is None:
+            self.frontend_stage_column_widget.setMinimumWidth(300)
+            self.frontend_stage_column_widget.setMaximumWidth(unlimited)
+            self.frontend_stage_label.setMinimumWidth(300)
+            self.frontend_stage_label.setMaximumWidth(unlimited)
+            self.frontend_stage_column_widget.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Expanding,
+            )
+            return
+        h, w = self._frontend_stage_bgr.shape[:2]
+        if h <= 0 or w <= 0:
+            return
+        aspect = w / h
+        if aspect < 0.9 and self._frontend_flow_stage != "select":
+            available_h = self.frontend_preview_row_widget.height() - 28
+            if available_h < 260:
+                available_h = self.frontend_stage_label.height()
+            if available_h < 260:
+                available_h = 420
+            target_w = max(260, min(360, int(available_h * aspect) + 10))
+            self.frontend_stage_column_widget.setFixedWidth(target_w)
+            self.frontend_stage_label.setFixedWidth(target_w)
+            self.frontend_stage_column_widget.setSizePolicy(
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Expanding,
+            )
+            return
+        self.frontend_stage_column_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.frontend_stage_column_widget.setMinimumWidth(420)
+        self.frontend_stage_column_widget.setMaximumWidth(unlimited)
+        self.frontend_stage_label.setMinimumWidth(420)
+        self.frontend_stage_label.setMaximumWidth(unlimited)
+
     def _refresh_frontend_stage(self, empty_text: str = "Select a dance") -> None:
         if not hasattr(self, "frontend_stage_label"):
             return
+        self._update_frontend_stage_geometry()
         if self._frontend_stage_bgr is None:
             self.frontend_stage_label.clear()
             self.frontend_stage_label.setText(empty_text)
@@ -1003,6 +1477,98 @@ class MainWindow(QMainWindow):
             self._frontend_stage_bgr,
             empty_text,
         )
+
+    def _start_frontend_camera_preview(self) -> bool:
+        if self._frontend_camera_cap is not None and self._frontend_camera_cap.isOpened():
+            return True
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            cap.release()
+            self._set_bgr_on_preview_label(
+                self.frontend_camera_label,
+                None,
+                "Camera unavailable",
+            )
+            self.frontend_status_label.setText(
+                "Could not open camera. Check macOS camera permission, then try Camera setup again."
+            )
+            return False
+        self._frontend_camera_cap = cap
+        self._frontend_camera_timer = QTimer(self)
+        self._frontend_camera_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._frontend_camera_timer.timeout.connect(self._on_frontend_camera_tick)
+        self._frontend_camera_timer.start(33)
+        self._on_frontend_camera_tick()
+        return True
+
+    def _stop_frontend_camera_preview(self) -> None:
+        self._stop_frontend_camera_recording()
+        if self._frontend_camera_timer is not None:
+            self._frontend_camera_timer.stop()
+            self._frontend_camera_timer.deleteLater()
+            self._frontend_camera_timer = None
+        if self._frontend_camera_cap is not None:
+            self._frontend_camera_cap.release()
+            self._frontend_camera_cap = None
+        if hasattr(self, "frontend_camera_label"):
+            self._set_bgr_on_preview_label(
+                self.frontend_camera_label,
+                None,
+                "Camera preview",
+            )
+
+    def _on_frontend_camera_tick(self) -> None:
+        if self._frontend_camera_cap is None:
+            return
+        ok, frame = self._frontend_camera_cap.read()
+        if not ok or frame is None:
+            self.frontend_camera_label.setText("Camera frame unavailable")
+            return
+        frame = cv2.flip(frame, 1)
+        self._set_bgr_on_preview_label(self.frontend_camera_label, frame, "Camera preview")
+        self._write_frontend_camera_recording_frame(frame)
+
+    def _start_frontend_camera_recording(self, frame) -> None:
+        self._stop_frontend_camera_recording()
+        video_utils.ensure_app_dirs()
+        h, w = frame.shape[:2]
+        fps = 30.0
+        if self._frontend_camera_cap is not None:
+            camera_fps = float(self._frontend_camera_cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if 5.0 <= camera_fps <= 60.0:
+                fps = camera_fps
+        path = video_utils.TEMP_DIR / f"frontend_performance_{uuid.uuid4().hex[:10]}.mp4"
+        try:
+            result = video_utils.create_writer(str(path), w, h, fps)
+        except video_utils.VideoOpenError as e:
+            self.frontend_status_label.setText(f"Could not record camera for scoring: {e}")
+            return
+        self._frontend_record_writer = result.writer
+        self._frontend_record_path = result.path
+        self._frontend_record_size = (result.width, result.height)
+        self._frontend_record_frame_count = 0
+
+    def _write_frontend_camera_recording_frame(self, frame) -> None:
+        if self._frontend_record_writer is None:
+            return
+        out_frame = frame
+        if self._frontend_record_size is not None:
+            w, h = self._frontend_record_size
+            if frame.shape[1] != w or frame.shape[0] != h:
+                out_frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+        self._frontend_record_writer.write(out_frame)
+        self._frontend_record_frame_count += 1
+
+    def _stop_frontend_camera_recording(self) -> str | None:
+        path = self._frontend_record_path
+        frames = self._frontend_record_frame_count
+        if self._frontend_record_writer is not None:
+            self._frontend_record_writer.release()
+        self._frontend_record_writer = None
+        self._frontend_record_path = None
+        self._frontend_record_size = None
+        self._frontend_record_frame_count = 0
+        return path if path and frames > 3 else None
 
     def _start_frontend_backdrop_video(self) -> None:
         if not hasattr(self, "frontend_backdrop_label"):
@@ -1148,6 +1714,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         self._stop_playback()
         self._stop_ref_practice_playback()
+        self._stop_challenge_audio()
+        self._stop_frontend_camera_preview()
         self._set_frontend_music_enabled(False)
         if self._frontend_music_player is not None:
             self._frontend_music_player.stop()
@@ -1867,6 +2435,7 @@ class MainWindow(QMainWindow):
         self.compare_status_label.setText(report.one_line())
         if self._calibration_target == "frontend" and hasattr(self, "frontend_status_label"):
             self.frontend_status_label.setText(report.one_line())
+            self._set_frontend_flow_stage("ready")
             if self._pending_frontend_start_after_calibration:
                 self._pending_frontend_start_after_calibration = False
                 if report.is_ready:
@@ -1908,6 +2477,67 @@ class MainWindow(QMainWindow):
         self.ref_calibration_label.setText(ref_text)
         self.user_calibration_label.setText(user_text)
 
+    def _set_trim_duration(self, *, is_reference: bool, duration_sec: float) -> None:
+        start_spin = self.ref_trim_start_spin if is_reference else self.user_trim_start_spin
+        end_spin = self.ref_trim_end_spin if is_reference else self.user_trim_end_spin
+        duration = max(0.0, float(duration_sec or 0.0))
+        start_spin.blockSignals(True)
+        end_spin.blockSignals(True)
+        start_spin.setMaximum(max(0.0, duration))
+        end_spin.setMaximum(max(0.0, duration))
+        start_spin.setValue(0.0)
+        end_spin.setValue(duration)
+        start_spin.blockSignals(False)
+        end_spin.blockSignals(False)
+        self._refresh_trim_status()
+
+    def _on_trim_full_clicked(self) -> None:
+        if self._ref_meta is not None:
+            self._set_trim_duration(is_reference=True, duration_sec=self._ref_meta.duration_sec)
+        if self._user_meta is not None:
+            self._set_trim_duration(is_reference=False, duration_sec=self._user_meta.duration_sec)
+        self._refresh_trim_status()
+
+    def _refresh_trim_status(self) -> None:
+        if not hasattr(self, "trim_status_label"):
+            return
+        ref = f"{self.ref_trim_start_spin.value():.2f}-{self.ref_trim_end_spin.value():.2f}s"
+        user = f"{self.user_trim_start_spin.value():.2f}-{self.user_trim_end_spin.value():.2f}s"
+        self.trim_status_label.setText(f"Scoring windows: reference {ref}; performance {user}.")
+
+    def _trim_pose_sequence(
+        self,
+        seq: PoseSequence,
+        *,
+        start_sec: float,
+        end_sec: float,
+        label: str,
+    ) -> PoseSequence | None:
+        start = max(0.0, float(start_sec))
+        end = max(0.0, float(end_sec))
+        if end <= start:
+            QMessageBox.warning(
+                self,
+                "Trim window",
+                f"{label} stop time must be after the start time.",
+            )
+            return None
+        frames = [f for f in seq.frames if start <= float(f.time_sec) <= end]
+        if len(frames) < 3:
+            QMessageBox.warning(
+                self,
+                "Trim window",
+                f"{label} trim has only {len(frames)} pose frame(s). Widen the scoring window.",
+            )
+            return None
+        return PoseSequence(
+            source_path=seq.source_path,
+            fps=seq.fps,
+            frames=frames,
+            video_width=seq.video_width,
+            video_height=seq.video_height,
+        )
+
     def _load_comparison_video(self, path: str, *, is_reference: bool) -> None:
         cap = None
         try:
@@ -1925,6 +2555,7 @@ class MainWindow(QMainWindow):
         self.overlay_group.setVisible(False)
 
         resolved = str(Path(path).resolve())
+        load_status = "Click Process Reference / Process User to extract poses, then Compare Videos."
         if is_reference:
             self._stop_ref_practice_playback()
             self._active_library_dance_id = None
@@ -1942,6 +2573,16 @@ class MainWindow(QMainWindow):
                 if first is not None
                 else "Could not read frame 0."
             )
+            self._set_trim_duration(is_reference=True, duration_sec=meta.duration_sec)
+            if self._source_looks_already_mirrored(resolved):
+                self.mirror_practice_checkbox.setChecked(False)
+                self.mirror_scoring_checkbox.setChecked(False)
+                load_status = (
+                    "Detected an already-mirrored reference file, so mirror practice/scoring were turned off."
+                )
+            else:
+                self.mirror_practice_checkbox.setChecked(True)
+                self.mirror_scoring_checkbox.setChecked(True)
         else:
             self._user_path = resolved
             self._user_meta = meta
@@ -1956,16 +2597,17 @@ class MainWindow(QMainWindow):
                 if first is not None
                 else "Could not read frame 0."
             )
+            self._set_trim_duration(is_reference=False, duration_sec=meta.duration_sec)
         self._last_comparison = None
+        self._last_scored_ref_sequence = None
+        self._last_scored_user_sequence = None
         self._refresh_calibration_labels()
         self.compare_scores_label.setText("")
         self.compare_explain.clear()
         self._refresh_comparison_preview_panels()
         QTimer.singleShot(0, self._refresh_comparison_preview_panels)
         self._set_compare_ui_busy(False)
-        self.compare_status_label.setText(
-            "Click Process Reference / Process User to extract poses, then Compare Videos."
-        )
+        self.compare_status_label.setText(load_status)
 
     def _on_process_ref_clicked(self) -> None:
         if not self._ref_path or self._comparison_workers_busy():
@@ -2057,6 +2699,8 @@ class MainWindow(QMainWindow):
     def _on_extract_progress(self, pct: int, message: str) -> None:
         self.progress.setValue(max(0, min(100, pct)))
         self.compare_status_label.setText(message)
+        if self._frontend_scoring_active and hasattr(self, "frontend_loading_status"):
+            self.frontend_loading_status.setText(message)
 
     def _on_extract_finished(self, seq: PoseSequence) -> None:
         n = len(seq.frames)
@@ -2075,17 +2719,33 @@ class MainWindow(QMainWindow):
         self.compare_status_label.setText(
             f"Pose extraction finished ({n} frames). You can compare when both clips are ready."
         )
+        self._last_scored_ref_sequence = None
+        self._last_scored_user_sequence = None
 
     def _on_extract_failed(self, message: str) -> None:
+        if self._extract_target == "frontend_user":
+            self._frontend_pending_compare_after_extract = False
+            self._frontend_scoring_active = False
+            self._set_frontend_loading(False)
+            self.compare_status_label.setText("Pose extraction stopped.")
+            self._show_frontend_results(error_message=message)
+            return
         if message != "Cancelled.":
             QMessageBox.warning(self, "Pose extraction", message)
         self.compare_status_label.setText("Pose extraction stopped.")
 
     def _on_extract_thread_finished(self) -> None:
+        target = self._extract_target
         self._extract_worker = None
         self.btn_load.setEnabled(True)
         self.btn_process.setEnabled(self._video_path is not None)
         self._set_compare_ui_busy(False)
+        if (
+            target == "frontend_user"
+            and self._frontend_pending_compare_after_extract
+        ):
+            self._frontend_pending_compare_after_extract = False
+            QTimer.singleShot(0, self._start_frontend_compare_after_extract)
 
     def _on_compare_clicked(self) -> None:
         if self._worker is not None and self._worker.isRunning():
@@ -2103,11 +2763,27 @@ class MainWindow(QMainWindow):
             return
         if not self._confirm_pair_calibration_ready():
             return
+        ref_seq = self._trim_pose_sequence(
+            self._ref_sequence,
+            start_sec=self.ref_trim_start_spin.value(),
+            end_sec=self.ref_trim_end_spin.value(),
+            label="Reference",
+        )
+        user_seq = self._trim_pose_sequence(
+            self._user_sequence,
+            start_sec=self.user_trim_start_spin.value(),
+            end_sec=self.user_trim_end_spin.value(),
+            label="Performance",
+        )
+        if ref_seq is None or user_seq is None:
+            return
+        self._last_scored_ref_sequence = ref_seq
+        self._last_scored_user_sequence = user_seq
         self._teardown_overlay()
         self.overlay_group.setVisible(False)
         self._compare_worker = CompareSequencesWorker(
-            self._ref_sequence,
-            self._user_sequence,
+            ref_seq,
+            user_seq,
             mirror_reference_for_scoring=self.mirror_scoring_checkbox.isChecked(),
         )
         self._compare_worker.progress.connect(self.compare_status_label.setText)
@@ -2118,6 +2794,10 @@ class MainWindow(QMainWindow):
         self.btn_process.setEnabled(False)
         self.btn_load.setEnabled(False)
         self.progress.setRange(0, 0)
+        self.compare_status_label.setText(
+            f"Comparing trimmed windows: reference {len(ref_seq.frames)} frames, "
+            f"performance {len(user_seq.frames)} frames…"
+        )
         self._compare_worker.start()
 
     def _on_compare_finished(self, result: ComparisonResult) -> None:
@@ -2133,7 +2813,8 @@ class MainWindow(QMainWindow):
         self.compare_scores_label.setText(
             f"Overall similarity: {result.overall_score:.1f}%\n"
             f"Timing score: {bd.timing:.1f}%  |  Arms: {bd.arms:.1f}%  |  "
-            f"Legs: {bd.legs:.1f}%  |  Torso/posture: {bd.torso_posture:.1f}%\n"
+            f"Legs: {bd.legs:.1f}%  |  Torso/posture: {bd.torso_posture:.1f}%  |  "
+            f"Movement: {bd.movement:.1f}%\n"
             f"(Angles: {bd.joint_angles:.1f}%  ·  Directions: {bd.limb_directions:.1f}%  ·  "
             f"Distances: {bd.relative_distances:.1f}%)\n"
             f"DTW mean step cost: {result.dtw_mean_cost:.2f}  ·  "
@@ -2149,6 +2830,135 @@ class MainWindow(QMainWindow):
         self.compare_status_label.setText("Comparison failed.")
         self._teardown_overlay()
         self.overlay_group.setVisible(False)
+
+    def _start_frontend_scoring(self, record_path: str | None) -> None:
+        self._stop_challenge_audio()
+        self._last_comparison = None
+        self.compare_scores_label.setText("")
+        self.compare_explain.clear()
+
+        if not record_path or not Path(record_path).is_file():
+            self._show_frontend_results(
+                error_message="Camera recording was not available, so no pose score was saved."
+            )
+            return
+
+        self._frontend_scoring_active = True
+        self._set_frontend_loading(
+            True,
+            "Opening camera recording...",
+            title="Grading",
+        )
+        self.frontend_status_label.setText("Grading performance...")
+        self.frontend_ready_badge.setText("GRADING")
+
+        cap = None
+        try:
+            cap = video_utils.open_capture(record_path)
+            meta = video_utils.read_metadata(cap, record_path)
+            first = video_utils.read_first_frame(cap)
+        except video_utils.VideoOpenError as e:
+            self._frontend_scoring_active = False
+            self._set_frontend_loading(False)
+            self._show_frontend_results(error_message=str(e))
+            return
+        finally:
+            if cap is not None:
+                cap.release()
+
+        self._user_path = str(Path(record_path).resolve())
+        self._user_meta = meta
+        self._user_sequence = None
+        self._user_calibration = self._frontend_calibration
+        self._user_preview_bgr = first.copy() if first is not None else None
+        self.compare_user_label.setText(
+            f"Frontend camera recording: {self._user_path}\n"
+            f"{meta.summary()} - pose not extracted yet."
+        )
+        self._set_trim_duration(is_reference=False, duration_sec=meta.duration_sec)
+        if self._ref_meta is not None:
+            self._set_trim_duration(is_reference=True, duration_sec=self._ref_meta.duration_sec)
+
+        self._extract_target = "frontend_user"
+        self._frontend_pending_compare_after_extract = True
+        self._start_extract_sequence(self._user_path, "frontend performance")
+
+    def _start_frontend_compare_after_extract(self) -> None:
+        if self._ref_sequence is None or self._user_sequence is None:
+            self._frontend_scoring_active = False
+            self._set_frontend_loading(False)
+            self._show_frontend_results(
+                error_message="Could not score this run because pose extraction did not finish."
+            )
+            return
+
+        ref_seq = self._trim_pose_sequence(
+            self._ref_sequence,
+            start_sec=self.ref_trim_start_spin.value(),
+            end_sec=self.ref_trim_end_spin.value(),
+            label="Reference",
+        )
+        user_seq = self._trim_pose_sequence(
+            self._user_sequence,
+            start_sec=self.user_trim_start_spin.value(),
+            end_sec=self.user_trim_end_spin.value(),
+            label="Performance",
+        )
+        if ref_seq is None or user_seq is None:
+            self._frontend_scoring_active = False
+            self._set_frontend_loading(False)
+            self._show_frontend_results(
+                error_message="Could not score this run because the scoring window was too short."
+            )
+            return
+
+        self._last_scored_ref_sequence = ref_seq
+        self._last_scored_user_sequence = user_seq
+        self._teardown_overlay()
+        self.overlay_group.setVisible(False)
+        self._compare_worker = CompareSequencesWorker(
+            ref_seq,
+            user_seq,
+            mirror_reference_for_scoring=self.mirror_scoring_checkbox.isChecked(),
+        )
+        self._compare_worker.progress.connect(self._on_frontend_compare_progress)
+        self._compare_worker.finished_ok.connect(self._on_frontend_compare_finished)
+        self._compare_worker.failed.connect(self._on_frontend_compare_failed)
+        self._compare_worker.finished.connect(self._on_compare_thread_finished)
+        self._set_compare_ui_busy(True)
+        self.btn_process.setEnabled(False)
+        self.btn_load.setEnabled(False)
+        self.progress.setRange(0, 0)
+        self._set_frontend_loading(
+            True,
+            "Scoring pose similarity...",
+            title="Grading",
+        )
+        self.compare_status_label.setText(
+            f"Comparing reference {len(ref_seq.frames)} frames with "
+            f"performance {len(user_seq.frames)} frames..."
+        )
+        self._compare_worker.start()
+
+    def _on_frontend_compare_progress(self, message: str) -> None:
+        self.compare_status_label.setText(message)
+        self.frontend_loading_status.setText(message)
+
+    def _on_frontend_compare_finished(self, result: ComparisonResult) -> None:
+        self._on_compare_finished(result)
+        self._frontend_scoring_active = False
+        self._set_frontend_loading(False)
+        self._show_frontend_results()
+        self._resume_frontend_music()
+
+    def _on_frontend_compare_failed(self, message: str) -> None:
+        self.compare_status_label.setText("Comparison failed.")
+        self._teardown_overlay()
+        self.overlay_group.setVisible(False)
+        self._frontend_scoring_active = False
+        self._set_frontend_loading(False)
+        self._show_frontend_results(error_message=message)
+        self._resume_frontend_music()
 
     def _on_compare_thread_finished(self) -> None:
         self._compare_worker = None
@@ -2192,6 +3002,9 @@ class MainWindow(QMainWindow):
         self._set_bgr_on_preview_label(self.user_preview_label, self._user_preview_bgr, "No video loaded")
 
     def _set_bgr_on_preview_label(self, label: QLabel, bgr, empty_text: str) -> None:
+        if isinstance(label, AspectPreviewLabel):
+            label.set_bgr_frame(bgr, empty_text)
+            return
         if bgr is None:
             label.clear()
             label.setText(empty_text)
@@ -2208,7 +3021,15 @@ class MainWindow(QMainWindow):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        label.setPixmap(scaled)
+        canvas = QPixmap(tgt)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        x = (tgt.width() - scaled.width()) // 2
+        y = (tgt.height() - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
+        painter.end()
+        label.setPixmap(canvas)
         label.setText("")
 
     def _refresh_overlay_preview(self) -> None:
@@ -2263,6 +3084,22 @@ class MainWindow(QMainWindow):
         if pairs.size == 0:
             self.overlay_group.setVisible(False)
             return
+        ref_seq = self._last_scored_ref_sequence or self._ref_sequence
+        user_seq = self._last_scored_user_sequence or self._user_sequence
+        if ref_seq is not None and user_seq is not None:
+            mapped_pairs: list[tuple[int, int]] = []
+            for ri, uj in pairs.astype(int):
+                if 0 <= ri < len(ref_seq.frames) and 0 <= uj < len(user_seq.frames):
+                    mapped_pairs.append(
+                        (
+                            int(ref_seq.frames[int(ri)].frame_index),
+                            int(user_seq.frames[int(uj)].frame_index),
+                        )
+                    )
+            pairs = np.asarray(mapped_pairs, dtype=int)
+            if pairs.size == 0:
+                self.overlay_group.setVisible(False)
+                return
 
         self._overlay_pairs = pairs
         try:
@@ -2278,8 +3115,8 @@ class MainWindow(QMainWindow):
             self.overlay_group.setVisible(False)
             return
 
-        rf = float(self._ref_sequence.fps) if self._ref_sequence else 30.0
-        uf = float(self._user_sequence.fps) if self._user_sequence else 30.0
+        rf = float(ref_seq.fps) if ref_seq else 30.0
+        uf = float(user_seq.fps) if user_seq else 30.0
         self._overlay_play_fps = max(8.0, min(60.0, (rf + uf) * 0.5))
 
         self.overlay_group.setVisible(True)
@@ -2351,8 +3188,37 @@ class MainWindow(QMainWindow):
     def _normalize_catalog_text(self, text: str) -> str:
         return "".join(ch for ch in text.casefold() if ch.isalnum())
 
+    def _infer_frontend_company_artist_from_text(self, text: str) -> tuple[str, str]:
+        haystack = self._normalize_catalog_text(text)
+        for company, artists in FRONTEND_ARTIST_COMPANIES.items():
+            for artist, aliases in artists.items():
+                for alias in aliases:
+                    if self._normalize_catalog_text(alias) in haystack:
+                        return company, artist
+        return "OTHER", "Other"
+
+    def _suggest_dance_title(self, path: str | None) -> str:
+        if not path:
+            return "Untitled Dance"
+        title = Path(path).stem
+        for token in ("[MIRRORED]", "(MIRRORED)", "Official", "official", "Dance Practice"):
+            title = title.replace(token, " ")
+        title = title.replace("_", " ").replace("-", " ").replace("#", " ")
+        title = " ".join(title.split())
+        return title or "Untitled Dance"
+
+    def _source_looks_already_mirrored(self, path: str | None) -> bool:
+        if not path:
+            return False
+        haystack = self._normalize_catalog_text(Path(path).stem)
+        return "mirrored" in haystack or "mirror" in haystack
+
     def _classify_frontend_dance(self, dance) -> tuple[str, str]:
-        haystack = self._normalize_catalog_text(
+        company = str(getattr(dance, "company", "") or "").upper()
+        artist = str(getattr(dance, "artist", "") or "")
+        if company in FRONTEND_COMPANY_ORDER and company != "ALL" and artist:
+            return company, artist
+        return self._infer_frontend_company_artist_from_text(
             " ".join(
                 [
                     getattr(dance, "name", ""),
@@ -2361,12 +3227,6 @@ class MainWindow(QMainWindow):
                 ]
             )
         )
-        for company, artists in FRONTEND_ARTIST_COMPANIES.items():
-            for artist, aliases in artists.items():
-                for alias in aliases:
-                    if self._normalize_catalog_text(alias) in haystack:
-                        return company, artist
-        return "OTHER", "Other"
 
     def _frontend_catalog_entries(self) -> list[dict[str, object]]:
         entries: list[dict[str, object]] = []
@@ -2426,6 +3286,26 @@ class MainWindow(QMainWindow):
         btn.setProperty("selected", "true" if selected else "false")
         btn.style().unpolish(btn)
         btn.style().polish(btn)
+
+    def _dance_card_icon(self, thumb: Path, size: QSize) -> QIcon:
+        pm = QPixmap(str(thumb))
+        if pm.isNull():
+            return QIcon()
+        canvas = QPixmap(size)
+        canvas.fill(Qt.GlobalColor.transparent)
+        scaled = pm.scaled(
+            size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(canvas.rect(), QColor(255, 255, 255, 34))
+        x = (size.width() - scaled.width()) // 2
+        y = (size.height() - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
+        painter.end()
+        return QIcon(canvas)
 
     def _set_frontend_company_filter(self, company: str) -> None:
         self._frontend_selected_company = company
@@ -2545,12 +3425,13 @@ class MainWindow(QMainWindow):
             duration = str(entry["duration"])
             meta = f"{entry['artist']} · {duration}" if duration else str(entry["artist"])
             btn.setText(f"{entry['name']}\n{meta}\n{entry['company']}")
-            btn.setMinimumHeight(126)
-            btn.setMinimumWidth(230)
+            btn.setMinimumHeight(140)
+            btn.setMinimumWidth(250)
             thumb = entry.get("thumb")
             if isinstance(thumb, Path) and thumb.is_file():
-                btn.setIcon(QIcon(str(thumb)))
-                btn.setIconSize(QSize(72, 72))
+                icon_size = QSize(96, 108)
+                btn.setIcon(self._dance_card_icon(thumb, icon_size))
+                btn.setIconSize(icon_size)
             dance_id = str(entry["id"])
             btn.clicked.connect(
                 lambda _checked=False, did=dance_id: self._select_frontend_dance_id(did)
@@ -2594,21 +3475,22 @@ class MainWindow(QMainWindow):
         else:
             self.frontend_song_title_label.setText("Select a dance")
             self.frontend_song_meta_label.setText("Pick a company, artist, and saved dance.")
-            self.frontend_ready_badge.setText("READY")
             self.frontend_status_label.setText("Select a saved dance.")
             self._set_frontend_stage_from_bgr(None, "Select a dance")
+            self._set_frontend_flow_stage("select")
         self._refresh_frontend_controls()
 
     def _on_frontend_dance_changed(self, _index: int) -> None:
         self._frontend_calibration = None
+        self._stop_frontend_countdown()
         dance_id = self._selected_frontend_dance_id()
         if dance_id is None:
             self.frontend_song_title_label.setText("Select a dance")
             self.frontend_song_meta_label.setText("Pick a company, artist, and saved dance.")
-            self.frontend_ready_badge.setText("READY")
             self.frontend_status_label.setText("Select a saved dance.")
             self._set_frontend_stage_from_bgr(None, "Select a dance")
             self._sync_frontend_dance_card_selection()
+            self._set_frontend_flow_stage("select")
             self._refresh_frontend_controls()
             return
 
@@ -2633,7 +3515,6 @@ class MainWindow(QMainWindow):
             meta_parts.append(duration)
         self.frontend_song_title_label.setText(md.name)
         self.frontend_song_meta_label.setText(" · ".join(meta_parts))
-        self.frontend_ready_badge.setText("READY")
         if first is not None:
             if md.mirror_for_practice:
                 first = cv2.flip(first, 1)
@@ -2642,8 +3523,12 @@ class MainWindow(QMainWindow):
             self._set_frontend_stage_from_bgr(None, "Preview unavailable")
         players = self._frontend_expected_people()
         player_text = "1 player" if players == 1 else f"{players} players"
-        self.frontend_status_label.setText(f"{md.name} selected · {player_text}")
+        best_text = self._frontend_best_score_suffix(dance_id)
+        self.frontend_status_label.setText(
+            f"{md.name} selected · {player_text}{best_text} · press Select"
+        )
         self._sync_frontend_dance_card_selection()
+        self._set_frontend_flow_stage("select")
         self._refresh_frontend_controls()
 
     def _on_frontend_players_changed(self, _index: int) -> None:
@@ -2653,9 +3538,82 @@ class MainWindow(QMainWindow):
                 self.expected_people_combo.setCurrentIndex(i)
                 break
         self._frontend_calibration = None
-        self.frontend_status_label.setText("Player count changed. Calibrate again before starting.")
+        best_text = self._frontend_best_score_suffix()
+        self.frontend_status_label.setText(
+            f"Player count changed{best_text}. Calibrate again before starting."
+        )
         self._sync_frontend_player_buttons()
+        if self._frontend_flow_stage == "ready":
+            self._set_frontend_flow_stage("ready")
         self._refresh_frontend_controls()
+
+    def _on_frontend_select_clicked(self) -> None:
+        if not self._selected_frontend_dance_id():
+            QMessageBox.information(self, "Game", "Choose a saved dance first.")
+            return
+        self._stop_ref_practice_playback()
+        self._stop_frontend_camera_preview()
+        self._set_frontend_flow_stage("setup")
+        name = self.frontend_song_title_label.text() or "Dance"
+        self.frontend_status_label.setText(f"{name} setup · preview first or open camera setup.")
+
+    def _on_frontend_back_clicked(self) -> None:
+        self._stop_frontend_countdown()
+        self._stop_ref_practice_playback()
+        if self._frontend_flow_stage == "ready":
+            self._stop_frontend_camera_preview()
+            self._set_frontend_flow_stage("setup")
+            self.frontend_status_label.setText("Back to setup. Preview again or open camera setup.")
+        elif self._frontend_flow_stage == "results":
+            self._set_frontend_flow_stage("setup")
+            self.frontend_status_label.setText("Back to setup. Preview again or open camera setup.")
+        else:
+            self._frontend_calibration = None
+            self._stop_frontend_camera_preview()
+            self._set_frontend_flow_stage("select")
+            self.frontend_status_label.setText("Select a saved dance.")
+
+    def _stop_frontend_countdown(self) -> None:
+        stopped = False
+        if self._frontend_countdown_timer is not None:
+            self._frontend_countdown_timer.stop()
+            self._frontend_countdown_timer.deleteLater()
+            self._frontend_countdown_timer = None
+            stopped = True
+        self._set_frontend_countdown_overlay(False)
+        if stopped and self._frontend_flow_stage == "countdown":
+            self._set_frontend_flow_stage("ready")
+
+    def _start_frontend_countdown(self) -> None:
+        self._stop_ref_practice_playback()
+        self._stop_challenge_audio()
+        self._pause_frontend_music()
+        if self._frontend_camera_cap is None:
+            self._start_frontend_camera_preview()
+        self._frontend_countdown_value = 3
+        self._set_frontend_flow_stage("countdown")
+        self.frontend_status_label.setText("Get ready...")
+        self.frontend_ready_instructions.setText("3")
+        self._set_frontend_countdown_overlay(True, "3")
+        self._frontend_countdown_timer = QTimer(self)
+        self._frontend_countdown_timer.timeout.connect(self._on_frontend_countdown_tick)
+        self._frontend_countdown_timer.start(1000)
+
+    def _on_frontend_countdown_tick(self) -> None:
+        self._frontend_countdown_value -= 1
+        if self._frontend_countdown_value > 0:
+            self.frontend_ready_badge.setText(str(self._frontend_countdown_value))
+            self.frontend_ready_instructions.setText(str(self._frontend_countdown_value))
+            self._set_frontend_countdown_overlay(True, str(self._frontend_countdown_value))
+            return
+        if self._frontend_countdown_timer is not None:
+            self._frontend_countdown_timer.stop()
+            self._frontend_countdown_timer.deleteLater()
+            self._frontend_countdown_timer = None
+        self.frontend_ready_badge.setText("DANCE")
+        self.frontend_ready_instructions.setText("Dance!")
+        self._set_frontend_countdown_overlay(True, "DANCE")
+        QTimer.singleShot(350, self._start_frontend_reference_after_countdown)
 
     def _on_frontend_calibrate_clicked(self) -> None:
         if self._comparison_workers_busy():
@@ -2665,27 +3623,54 @@ class MainWindow(QMainWindow):
             self._pending_frontend_start_after_calibration = False
             QMessageBox.information(self, "Game", "Choose a saved dance first.")
             return
-        self._sync_backend_library_combo_to_frontend(dance_id)
-        try:
-            md, seq = load_dance(dance_id)
-        except Exception as e:
-            self._pending_frontend_start_after_calibration = False
-            QMessageBox.warning(self, "Game", f"Could not load saved dance:\n{e}")
-            return
-        video_path = md.video_path or seq.source_path
-        if not video_path or not Path(video_path).is_file():
-            self._pending_frontend_start_after_calibration = False
-            QMessageBox.warning(self, "Game", "The saved dance video file is missing.")
-            return
+        self._pending_frontend_start_after_calibration = False
         self._frontend_calibration = None
-        self._start_calibration_scan(video_path, "game setup", "frontend")
+        self._set_frontend_flow_stage("ready")
+        opened = self._start_frontend_camera_preview()
+        if opened:
+            self.frontend_status_label.setText(
+                "Camera is on. Make sure everyone is fully in frame, spaced apart, and ready."
+            )
+
+    def _load_selected_frontend_reference(self) -> bool:
+        dance_id = self._selected_frontend_dance_id()
+        if not dance_id:
+            QMessageBox.information(self, "Game", "Choose a saved dance first.")
+            return False
+        self._sync_backend_library_combo_to_frontend(dance_id)
+        self._on_load_library_dance_clicked()
+        return self._active_library_dance_id == dance_id and bool(self._ref_path)
+
+    def _on_frontend_preview_clicked(self) -> None:
+        if (
+            self._ref_practice_timer is not None
+            and self._ref_practice_timer.isActive()
+        ):
+            self._stop_ref_practice_playback()
+            self.frontend_status_label.setText("Preview stopped.")
+            self._refresh_frontend_controls()
+            return
+        if self._comparison_workers_busy():
+            return
+        if not self._load_selected_frontend_reference():
+            return
+        self._set_app_mode("frontend")
+        self._on_ref_practice_play_clicked()
+        name = self._active_library_dance_name or "Dance"
+        self.frontend_status_label.setText(f"Previewing {name}.")
+        self._refresh_frontend_controls()
 
     def _on_frontend_start_clicked(self) -> None:
         if (
             self._ref_practice_timer is not None
             and self._ref_practice_timer.isActive()
         ):
+            was_challenge = self._ref_practice_challenge
             self._stop_ref_practice_playback()
+            self._stop_challenge_audio()
+            if was_challenge:
+                self._set_frontend_flow_stage("ready")
+            self._resume_frontend_music()
             self.frontend_status_label.setText("Stopped.")
             self._refresh_frontend_controls()
             return
@@ -2696,32 +3681,51 @@ class MainWindow(QMainWindow):
         if not dance_id:
             QMessageBox.information(self, "Game", "Choose a saved dance first.")
             return
-
-        if self._frontend_calibration is None:
-            self._pending_frontend_start_after_calibration = True
+        if self._frontend_flow_stage == "select":
+            self._on_frontend_select_clicked()
+            return
+        if self._frontend_flow_stage == "setup":
             self._on_frontend_calibrate_clicked()
             return
-        if self._frontend_calibration.is_risky:
-            choice = QMessageBox.question(
-                self,
-                "Calibration warning",
-                self._frontend_calibration.details_text()
-                + "\n\nStart anyway?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if choice != QMessageBox.StandardButton.Yes:
-                return
+        if self._frontend_flow_stage == "countdown":
+            self._stop_frontend_countdown()
+            self.frontend_status_label.setText("Countdown stopped.")
+            self._resume_frontend_music()
+            return
+        if self._frontend_flow_stage == "results":
+            self._set_frontend_flow_stage("ready")
+            self._start_frontend_countdown()
+            return
 
-        self._sync_backend_library_combo_to_frontend(dance_id)
-        self._on_load_library_dance_clicked()
-        if self._active_library_dance_id != dance_id or not self._ref_path:
+        self._start_frontend_countdown()
+
+    def _start_frontend_reference_after_countdown(self) -> None:
+        self._set_frontend_countdown_overlay(False)
+        if not self._load_selected_frontend_reference():
+            self._set_frontend_flow_stage("ready")
+            self._resume_frontend_music()
             return
         self._set_app_mode("frontend")
-        self._on_ref_practice_play_clicked()
+        self._pause_frontend_music()
+        self._last_comparison = None
+        self.compare_scores_label.setText("")
+        self.compare_explain.clear()
+        if self._frontend_camera_cap is not None:
+            ok, frame = self._frontend_camera_cap.read()
+            if ok and frame is not None:
+                frame = cv2.flip(frame, 1)
+                self._set_bgr_on_preview_label(
+                    self.frontend_camera_label,
+                    frame,
+                    "Camera preview",
+                )
+                self._start_frontend_camera_recording(frame)
+                self._write_frontend_camera_recording_frame(frame)
+        self._play_challenge_audio()
+        self._start_ref_practice_playback(loop=False, challenge=True)
         players = self._frontend_expected_people()
         name = self._active_library_dance_name or "Dance"
-        self.frontend_status_label.setText(f"{name} · {players} player(s)")
+        self.frontend_status_label.setText(f"{name} · {players} player(s) · challenge running")
         self._refresh_frontend_controls()
 
     def _refresh_library_combo(self, *, select_id: str | None = None) -> None:
@@ -2737,8 +3741,57 @@ class MainWindow(QMainWindow):
                     self.library_combo.setCurrentIndex(i)
                     break
         self.library_combo.blockSignals(False)
+        has_saved = self.library_combo.count() > 1
+        self.btn_edit_library_dance.setEnabled(has_saved)
         self.btn_delete_library_dance.setEnabled(self.library_combo.count() > 1)
         self._refresh_frontend_dance_combo(select_id=select_id)
+
+    def _dance_details_dialog(
+        self,
+        *,
+        title: str,
+        initial_name: str,
+        initial_company: str,
+        initial_artist: str,
+    ) -> tuple[str, str, str] | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        layout = QFormLayout(dialog)
+        name_edit = QLineEdit(initial_name)
+        artist_edit = QLineEdit(initial_artist)
+        company_combo = QComboBox()
+        for company in FRONTEND_COMPANY_ORDER:
+            if company == "ALL":
+                continue
+            company_combo.addItem(FRONTEND_COMPANY_LABELS.get(company, company), company)
+        company = initial_company if initial_company in FRONTEND_COMPANY_ORDER else "OTHER"
+        for i in range(company_combo.count()):
+            if company_combo.itemData(i) == company:
+                company_combo.setCurrentIndex(i)
+                break
+
+        layout.addRow("Frontend title:", name_edit)
+        layout.addRow("Company:", company_combo)
+        layout.addRow("Artist/group:", artist_edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        name = name_edit.text().strip()
+        artist = artist_edit.text().strip()
+        company = str(company_combo.currentData() or "OTHER")
+        if not name:
+            QMessageBox.warning(self, title, "Enter the title that should appear on the frontend.")
+            return None
+        if not artist:
+            artist = "Other"
+        return name, company, artist
 
     def _on_save_dance_clicked(self) -> None:
         if self._comparison_workers_busy():
@@ -2750,16 +3803,24 @@ class MainWindow(QMainWindow):
                 "Load a reference video and click **Process Reference** first.",
             )
             return
-        text, ok = QInputDialog.getText(self, "Save dance", "Dance name:")
-        if not ok:
+        suggested_name = self._suggest_dance_title(self._ref_path)
+        company, artist = self._infer_frontend_company_artist_from_text(
+            f"{suggested_name} {self._ref_path}"
+        )
+        details = self._dance_details_dialog(
+            title="Save dance",
+            initial_name=suggested_name,
+            initial_company=company,
+            initial_artist=artist,
+        )
+        if details is None:
             return
-        name = text.strip()
-        if not name:
-            QMessageBox.warning(self, "Save dance", "Enter a name for this dance.")
-            return
+        name, company, artist = details
         try:
             md = save_dance_from_reference(
                 name=name,
+                company=company,
+                artist=artist,
                 reference_video_path=self._ref_path,
                 sequence=self._ref_sequence,
                 meta=self._ref_meta,
@@ -2773,6 +3834,45 @@ class MainWindow(QMainWindow):
             f"Saved dance “{md.name}” to the library ({md.dance_id[:8]}…)."
         )
         self._refresh_library_combo(select_id=md.dance_id)
+
+    def _on_edit_library_dance_clicked(self) -> None:
+        if self._comparison_workers_busy():
+            return
+        dance_id = self.library_combo.currentData()
+        if not dance_id:
+            QMessageBox.information(self, "Library", "Choose a saved dance to edit.")
+            return
+        try:
+            md = load_dance_metadata(str(dance_id))
+        except Exception as e:
+            QMessageBox.warning(self, "Library", f"Could not load dance details:\n{e}")
+            return
+        company, artist = self._classify_frontend_dance(md)
+        details = self._dance_details_dialog(
+            title="Edit dance details",
+            initial_name=md.name,
+            initial_company=company,
+            initial_artist=artist,
+        )
+        if details is None:
+            return
+        name, company, artist = details
+        try:
+            updated = update_dance_metadata(
+                str(dance_id),
+                name=name,
+                company=company,
+                artist=artist,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Library", f"Could not save dance details:\n{e}")
+            return
+        if self._active_library_dance_id == updated.dance_id:
+            self._active_library_dance_name = updated.name
+        self.compare_status_label.setText(
+            f"Updated “{updated.name}” · {FRONTEND_COMPANY_LABELS.get(company, company)} · {artist}."
+        )
+        self._refresh_library_combo(select_id=updated.dance_id)
 
     def _on_load_library_dance_clicked(self) -> None:
         if self._comparison_workers_busy():
@@ -2865,6 +3965,7 @@ class MainWindow(QMainWindow):
         self.compare_status_label.setText("Dance removed from library.")
 
     def _stop_ref_practice_playback(self) -> None:
+        was_challenge = self._ref_practice_challenge
         if self._ref_practice_timer is not None:
             self._ref_practice_timer.stop()
             self._ref_practice_timer.deleteLater()
@@ -2875,10 +3976,18 @@ class MainWindow(QMainWindow):
         self._ref_practice_started_at = 0.0
         self._ref_practice_last_frame_index = -1
         self._ref_practice_total_frames = 0
+        self._ref_practice_loop = True
+        self._ref_practice_challenge = False
+        if was_challenge:
+            self._stop_challenge_audio()
+            self._stop_frontend_camera_recording()
         self.btn_ref_practice_play.setText("Practice play")
         self._refresh_frontend_controls()
 
     def _on_ref_practice_play_clicked(self) -> None:
+        self._start_ref_practice_playback(loop=True, challenge=False)
+
+    def _start_ref_practice_playback(self, *, loop: bool, challenge: bool) -> None:
         if not self._ref_path or not Path(self._ref_path).is_file():
             QMessageBox.information(self, "Practice", "Load a reference video first.")
             return
@@ -2896,7 +4005,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Practice", f"Could not open:\n{self._ref_path}")
             self._ref_practice_cap = None
             return
+        self._ref_practice_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+        self._ref_practice_loop = loop
+        self._ref_practice_challenge = challenge
         pb_fps, pb_note = video_utils.resolve_playback_fps(self._ref_practice_cap, self._ref_meta)
         self._ref_practice_base_fps = max(1.0, float(pb_fps))
         self._ref_practice_total_frames = max(
@@ -2906,11 +4018,16 @@ class MainWindow(QMainWindow):
         self._ref_practice_started_at = time.monotonic()
         self._ref_practice_last_frame_index = -1
         self._ref_practice_timer = QTimer(self)
+        self._ref_practice_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._ref_practice_timer.timeout.connect(self._on_ref_practice_tick)
-        self._ref_practice_timer.start(16)
+        interval_ms = max(
+            5,
+            min(16, int(500 / max(1.0, self._ref_practice_base_fps))),
+        )
+        self._ref_practice_timer.start(interval_ms)
         self.btn_ref_practice_play.setText("Stop practice")
         self._refresh_frontend_controls()
-        msg = "Playing reference for practice in real time (silent)…"
+        msg = "Playing challenge with source audio…" if challenge else "Playing reference for practice in real time (silent)…"
         if pb_note:
             msg = f"{pb_note} {msg}"
         self.ref_preview_status.setText(msg)
@@ -2918,10 +4035,23 @@ class MainWindow(QMainWindow):
     def _on_ref_practice_tick(self) -> None:
         if self._ref_practice_cap is None:
             return
+        if (
+            not self._ref_practice_loop
+            and self._ref_practice_total_frames > 0
+        ):
+            elapsed = max(0.0, time.monotonic() - self._ref_practice_started_at)
+            raw_idx = int(
+                elapsed
+                * max(1.0, self._ref_practice_base_fps)
+                * self._playback_speed_ratio()
+            )
+            if raw_idx >= self._ref_practice_total_frames:
+                self._on_ref_practice_finished()
+                return
         target_index = self._clock_target_frame_index(
             self._ref_practice_started_at,
             self._ref_practice_base_fps,
-            loop=True,
+            loop=self._ref_practice_loop,
             total_frames=self._ref_practice_total_frames,
         )
         if target_index < 0:
@@ -2934,10 +4064,14 @@ class MainWindow(QMainWindow):
             return
         ret, frame = self._ref_practice_cap.read()
         if not ret or frame is None:
-            self._ref_practice_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            self._ref_practice_started_at = time.monotonic()
-            self._ref_practice_last_frame_index = -1
-            ret, frame = self._ref_practice_cap.read()
+            if self._ref_practice_loop:
+                self._ref_practice_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                self._ref_practice_started_at = time.monotonic()
+                self._ref_practice_last_frame_index = -1
+                ret, frame = self._ref_practice_cap.read()
+            else:
+                self._on_ref_practice_finished()
+                return
         if not ret or frame is None:
             self._stop_ref_practice_playback()
             self.ref_preview_status.setText("Practice playback ended (read error).")
@@ -2948,6 +4082,125 @@ class MainWindow(QMainWindow):
         self._set_bgr_on_preview_label(self.ref_preview_label, disp, "")
         self._set_frontend_stage_from_bgr(disp, "")
         self.ref_preview_status.setText(f"Practice playback · ~frame {self._ref_practice_last_frame_index + 1}")
+
+    def _on_ref_practice_finished(self) -> None:
+        was_challenge = self._ref_practice_challenge
+        record_path = self._stop_frontend_camera_recording() if was_challenge else None
+        self._stop_ref_practice_playback()
+        if not was_challenge:
+            self.ref_preview_status.setText("Practice playback ended.")
+            return
+        self.ref_preview_status.setText("Challenge playback ended.")
+        self._start_frontend_scoring(record_path)
+
+    def _show_frontend_grading_loading(self) -> None:
+        self._stop_challenge_audio()
+        self._set_frontend_loading(
+            True,
+            "Analyzing camera performance and preparing scores…",
+            title="Grading",
+        )
+        self.frontend_status_label.setText("Grading performance…")
+        self.frontend_ready_badge.setText("GRADING")
+        if self._frontend_grading_timer is not None:
+            self._frontend_grading_timer.stop()
+            self._frontend_grading_timer.deleteLater()
+        self._frontend_grading_timer = QTimer(self)
+        self._frontend_grading_timer.setSingleShot(True)
+        self._frontend_grading_timer.timeout.connect(self._finish_frontend_grading_loading)
+        self._frontend_grading_timer.start(2200)
+
+    def _finish_frontend_grading_loading(self) -> None:
+        if self._frontend_grading_timer is not None:
+            self._frontend_grading_timer.deleteLater()
+            self._frontend_grading_timer = None
+        self._set_frontend_loading(False)
+        self._show_frontend_results()
+        self._resume_frontend_music()
+
+    def _show_frontend_results(self, *, error_message: str | None = None) -> None:
+        dance_id = self._active_library_dance_id or self._selected_frontend_dance_id()
+        players = self._frontend_expected_people()
+        name = self._active_library_dance_name or self.frontend_song_title_label.text() or "Dance"
+        duration = self._ref_meta.duration_sec if self._ref_meta is not None else 0.0
+
+        score: float | None = None
+        score_label = "Complete"
+        details = {
+            "duration_sec": round(float(duration or 0.0), 3),
+            "source": "frontend_completion",
+        }
+        stats_line = "Practice finished. Pose score was not saved for this run."
+        if self._last_comparison is not None:
+            score = float(self._last_comparison.overall_score)
+            score_label = "Similarity"
+            bd = self._last_comparison.breakdown
+            details.update(
+                {
+                    "source": "comparison",
+                    "timing": round(float(bd.timing), 3),
+                    "arms": round(float(bd.arms), 3),
+                    "legs": round(float(bd.legs), 3),
+                    "torso_posture": round(float(bd.torso_posture), 3),
+                    "movement": round(float(bd.movement), 3),
+                    "joint_angles": round(float(bd.joint_angles), 3),
+                    "limb_directions": round(float(bd.limb_directions), 3),
+                    "relative_distances": round(float(bd.relative_distances), 3),
+                    "mean_abs_lag_frames": round(
+                        float(self._last_comparison.timing_mean_abs_lag_frames),
+                        3,
+                    ),
+                }
+            )
+            stats_line = (
+                f"Timing {bd.timing:.0f}% · Arms {bd.arms:.0f}% · "
+                f"Legs {bd.legs:.0f}% · Torso {bd.torso_posture:.0f}% · "
+                f"Movement {bd.movement:.0f}%"
+            )
+        elif error_message:
+            score_label = "Needs retry"
+            stats_line = f"No pose score saved: {error_message}"
+
+        best_before = best_score_for_dance(dance_id, player_count=players) if dance_id else None
+        record = None
+        run_count = 0
+        if dance_id and score is not None:
+            record = append_score_record(
+                dance_id,
+                player_count=players,
+                score=score,
+                mode="challenge",
+                details=details,
+            )
+            history = load_score_history(dance_id)
+            run_count = len([r for r in history if r.player_count == players])
+        best_after = best_score_for_dance(dance_id, player_count=players) if dance_id else None
+        best_score = best_after.score if best_after is not None else score
+        previous_best = best_before.score if best_before is not None else None
+        is_new_best = score is not None and (previous_best is None or score >= previous_best)
+
+        self.frontend_results_title.setText(f"{name} Results")
+        if score is None:
+            self.frontend_results_score.setText(score_label)
+        else:
+            self.frontend_results_score.setText(f"{score_label}: {score:.0f}%")
+        duration_text = self._format_time(duration) if duration > 0 else "--"
+        if best_score is None:
+            best_line = "No best score yet"
+        else:
+            best_line = (
+                f"New best: {best_score:.0f}%"
+                if is_new_best
+                else f"Best: {best_score:.0f}%"
+            )
+        record_line = f"Saved run #{run_count}" if record is not None else "Run not saved"
+        self.frontend_results_details.setText(
+            f"{best_line} · {players} player(s) · {duration_text}\n"
+            f"{stats_line}\n"
+            f"{record_line}."
+        )
+        self.frontend_status_label.setText("Challenge complete.")
+        self._set_frontend_flow_stage("results")
 
     def _sync_ref_practice_clock(self) -> None:
         if self._ref_practice_cap is None or self._ref_practice_started_at <= 0.0:

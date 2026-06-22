@@ -29,13 +29,31 @@ _LAMBDA_DTW_TIME_SYNC = 0.42
 # but persistent extra/missing visible limbs still count as a small pose mismatch.
 _VIS_HIDDEN_GATE = 0.35
 _VIS_VISIBLE_GATE = 0.70
-_VIS_MISMATCH_PENALTY_SCALE = 16.0
-_VIS_MISMATCH_MAX_PENALTY = 10.0
+_VIS_MISMATCH_PENALTY_SCALE = 28.0
+_VIS_MISMATCH_MAX_PENALTY = 18.0
 _VIS_ARM_JOINTS = (13, 15, 14, 16)  # elbows/wrists
 _VIS_LEG_JOINTS = (25, 27, 26, 28)  # knees/ankles
 _VIS_COMPARE_JOINTS = _VIS_ARM_JOINTS + _VIS_LEG_JOINTS
 
+# Overall dance scoring blend. Torso/posture matters, but it should not rescue
+# a run where the dancer skipped the arm/leg hits or barely moved.
+_OVERALL_W_ARMS = 0.28
+_OVERALL_W_LEGS = 0.22
+_OVERALL_W_TORSO = 0.12
+_OVERALL_W_TIMING = 0.16
+_OVERALL_W_MOVEMENT = 0.22
+_MOTION_DIFF_SIGMA = 0.65
+_MOTION_ACTIVITY_FLOOR = 0.035
+
 assert abs(WEIGHT_ANGLES + WEIGHT_DIRECTIONS + WEIGHT_DISTANCES + WEIGHT_POSTURE - 1.0) < 1e-6
+assert abs(
+    _OVERALL_W_ARMS
+    + _OVERALL_W_LEGS
+    + _OVERALL_W_TORSO
+    + _OVERALL_W_TIMING
+    + _OVERALL_W_MOVEMENT
+    - 1.0
+) < 1e-6
 
 
 def _angle_diff(a: float, b: float) -> float:
@@ -207,6 +225,80 @@ def _visibility_penalty_from_ratio(ratio: float) -> float:
     return min(_VIS_MISMATCH_MAX_PENALTY, ratio * _VIS_MISMATCH_PENALTY_SCALE)
 
 
+def _feature_delta(a: FrameFeatures, b: FrameFeatures, mask: np.ndarray) -> Tuple[float, float]:
+    """Return weighted per-feature movement between two frames in the same clip."""
+    num = 0.0
+    den = 0.0
+    for k in np.where(mask)[0]:
+        wt = min(float(a.dim_weight[k]), float(b.dim_weight[k]))
+        if wt <= 0:
+            continue
+        av = float(a.vector[k])
+        bv = float(b.vector[k])
+        if not (math.isfinite(av) and math.isfinite(bv)):
+            continue
+        if SL_ANGLES.start <= k < SL_ANGLES.stop:
+            d = _angle_diff(av, bv)
+        elif k >= SL_DIST.start:
+            denom = max(abs(av), abs(bv), 0.12)
+            d = abs(av - bv) / denom
+        else:
+            d = abs(av - bv)
+        num += d * wt
+        den += wt
+    if den < 1e-8:
+        return 0.0, 0.0
+    return num / den, den
+
+
+def _motion_delta_similarity(ref_delta: float, user_delta: float) -> float:
+    activity = max(ref_delta, user_delta)
+    if activity < _MOTION_ACTIVITY_FLOOR:
+        return 100.0
+    ratio = abs(ref_delta - user_delta) / max(activity, 1e-6)
+    score = 100.0 * math.exp(-((ratio / _MOTION_DIFF_SIGMA) ** 2))
+    if ref_delta >= _MOTION_ACTIVITY_FLOOR and user_delta < ref_delta * 0.35:
+        score *= max(0.18, user_delta / max(ref_delta, 1e-6))
+    return max(0.0, min(100.0, score))
+
+
+def _path_motion_similarity(
+    path: np.ndarray,
+    feats_r: List[FrameFeatures],
+    feats_u: List[FrameFeatures],
+    mask: np.ndarray,
+) -> float:
+    """
+    Compare how much motion happened between aligned frames.
+
+    This catches the common bad case where a static camera performance gets a
+    decent pose match because DTW can align many frames to similar standing
+    shapes while the reference is actually dancing.
+    """
+    if path.shape[0] < 2:
+        return 100.0
+    num = 0.0
+    den = 0.0
+    active_pairs = 0
+    for t in range(1, path.shape[0]):
+        r0 = int(path[t - 1, 0])
+        u0 = int(path[t - 1, 1])
+        r1 = int(path[t, 0])
+        u1 = int(path[t, 1])
+        ref_delta, ref_w = _feature_delta(feats_r[r0], feats_r[r1], mask)
+        user_delta, user_w = _feature_delta(feats_u[u0], feats_u[u1], mask)
+        weight = max(ref_delta, user_delta, _MOTION_ACTIVITY_FLOOR) * max(ref_w, user_w)
+        if weight <= 1e-8:
+            continue
+        num += _motion_delta_similarity(ref_delta, user_delta) * weight
+        den += weight
+        if max(ref_delta, user_delta) >= _MOTION_ACTIVITY_FLOOR:
+            active_pairs += 1
+    if den < 1e-8 or active_pairs == 0:
+        return 100.0
+    return num / den
+
+
 def _mean_visibility_mismatch_ratios(
     path: np.ndarray,
     feats_r: List[FrameFeatures],
@@ -362,6 +454,7 @@ def _build_explanation(
     legs: float,
     torso: float,
     timing: float,
+    movement: float,
     visibility_penalty: float = 0.0,
     user_extra_ratio: float = 0.0,
     user_missing_ratio: float = 0.0,
@@ -381,7 +474,7 @@ def _build_explanation(
                 "Your right-side shapes are reading cleaner. Bring the left arm "
                 "through with the same intention and the score should climb."
             )
-    if math.isfinite(legs) and legs >= 78.0:
+    if math.isfinite(legs) and legs >= 78.0 and movement >= 65.0:
         lines.append(
             "Footwork is a bright spot: your leg shapes matched the reference closely overall."
         )
@@ -390,7 +483,7 @@ def _build_explanation(
             "The groove is there, but the lower-body shapes need the next polish pass. "
             "Recheck knee and foot placement on the bigger transitions."
         )
-    if math.isfinite(torso) and torso >= 88.0:
+    if math.isfinite(torso) and torso >= 88.0 and movement >= 58.0:
         lines.append(
             "Your posture stayed clean, which makes the whole run easier to read."
         )
@@ -403,9 +496,18 @@ def _build_explanation(
             "The moves are recognizable; the biggest unlock is timing. "
             "Count into the first beat and try landing each accent a touch closer to the reference."
         )
-    elif math.isfinite(timing) and timing >= 85.0:
+    elif math.isfinite(timing) and timing >= 85.0 and movement >= 65.0:
         lines.append(
             "Timing felt locked in; your rhythm stayed strong against the reference."
+        )
+    if math.isfinite(movement) and movement < 58.0:
+        lines.append(
+            "The shapes had moments, but the camera saw much less movement than the reference. "
+            "Commit to the travel, arm hits, and level changes so the score can climb."
+        )
+    elif math.isfinite(movement) and movement >= 82.0:
+        lines.append(
+            "Movement energy matched the reference nicely; you kept the run alive instead of marking it."
         )
     if visibility_penalty >= 2.0:
         if user_extra_ratio > user_missing_ratio * 1.25:
@@ -472,7 +574,7 @@ def compare_feature_sequences(
         adjusted = max(0.0, comb - _visibility_penalty_from_ratio(vis_ratio))
         per_frame_sim[t] = adjusted
         sim_sum += adjusted
-    overall = float(sim_sum / k) if k > 0 else 0.0
+    frame_overall = float(sim_sum / k) if k > 0 else 0.0
 
     g = feats_r[0].group_masks
     sim_angles = _mask_mean_similarity(path, feats_r, feats_u, g.get("angles", np.zeros(FEATURE_DIM, dtype=bool)), is_direction_block=False)
@@ -504,15 +606,39 @@ def compare_feature_sequences(
     def nan_to_num(x: float, fallback: float) -> float:
         return float(x) if math.isfinite(x) else fallback
 
+    motion_mask = (
+        g.get("angles", np.zeros(FEATURE_DIM, dtype=bool))
+        | g.get("directions", np.zeros(FEATURE_DIM, dtype=bool))
+        | g.get("distances", np.zeros(FEATURE_DIM, dtype=bool))
+    )
+    movement = _path_motion_similarity(path, feats_r, feats_u, motion_mask)
+
+    arms_score = nan_to_num(arms, max(0.0, frame_overall - _visibility_penalty_from_ratio(arm_visibility_ratio)))
+    legs_score = nan_to_num(legs, max(0.0, frame_overall - _visibility_penalty_from_ratio(leg_visibility_ratio)))
+    torso_score = nan_to_num(torso, frame_overall)
+    overall = (
+        _OVERALL_W_ARMS * arms_score
+        + _OVERALL_W_LEGS * legs_score
+        + _OVERALL_W_TORSO * torso_score
+        + _OVERALL_W_TIMING * timing
+        + _OVERALL_W_MOVEMENT * movement
+    )
+    overall = max(0.0, min(100.0, overall - 0.35 * _visibility_penalty_from_ratio(visibility_ratio)))
+    if movement < 60.0:
+        # If the reference has real motion and the user mostly marks/stands,
+        # stable torso and clip length should not inflate the final grade.
+        overall = min(overall, 34.0 + movement * 0.55)
+
     bd = ScoreBreakdown(
         overall=overall,
         timing=timing,
-        arms=nan_to_num(arms, overall),
-        legs=nan_to_num(legs, overall),
-        torso_posture=nan_to_num(torso, overall),
-        joint_angles=nan_to_num(sim_angles, overall),
-        limb_directions=nan_to_num(sim_dir, overall),
-        relative_distances=nan_to_num(sim_dist, overall),
+        arms=arms_score,
+        legs=legs_score,
+        torso_posture=torso_score,
+        joint_angles=nan_to_num(sim_angles, frame_overall),
+        limb_directions=nan_to_num(sim_dir, frame_overall),
+        relative_distances=nan_to_num(sim_dist, frame_overall),
+        movement=movement,
     )
 
     expl = _build_explanation(
@@ -523,6 +649,7 @@ def compare_feature_sequences(
         bd.legs,
         bd.torso_posture,
         timing,
+        movement,
         _visibility_penalty_from_ratio(visibility_ratio),
         user_extra_ratio,
         user_missing_ratio,

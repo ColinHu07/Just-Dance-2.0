@@ -85,6 +85,23 @@ def _moving_seq(name: str, n: int, *, static: bool = False) -> PoseSequence:
     return PoseSequence(name, 30.0, frames, 640, 480)
 
 
+def _no_pose_seq(name: str, n: int) -> PoseSequence:
+    frames: list[PoseFrame] = []
+    for k in range(n):
+        frames.append(
+            PoseFrame(
+                frame_index=k,
+                time_sec=k / 30.0,
+                image_width=640,
+                image_height=480,
+                landmarks_raw=None,
+                joints_norm_xy=np.full((33, 2), np.nan, dtype=np.float64),
+                reliability=np.zeros(33, dtype=np.float64),
+            )
+        )
+    return PoseSequence(name, 30.0, frames, 640, 480)
+
+
 def test_identical_sequences_score_near_perfect() -> None:
     a = _seq("a", 18)
     b = _seq("b", 18)
@@ -109,14 +126,42 @@ def test_warped_arm_scores_lower_than_identical() -> None:
     assert worse.overall_score < good.overall_score - 2.0
 
 
-def test_static_user_does_not_get_high_score_against_moving_reference() -> None:
+def test_static_user_reports_low_movement_against_moving_reference() -> None:
     ref = _moving_seq("ref", 28)
     static_user = _moving_seq("static", 28, static=True)
 
     result = compare_pose_sequences(ref, static_user)
 
-    assert result.overall_score < 65.0
-    assert result.breakdown.movement < 70.0
+    assert result.breakdown.movement < 15.0
+    assert any("much less movement" in line for line in result.explanation_lines)
+
+
+def test_no_user_pose_cannot_score_as_good_match() -> None:
+    ref = _moving_seq("ref", 28)
+    no_pose_user = _no_pose_seq("empty-camera", 28)
+
+    result = compare_pose_sequences(ref, no_pose_user)
+
+    assert result.overall_score == 0.0
+    assert result.breakdown.arms == 0.0
+    assert result.breakdown.legs == 0.0
+    assert result.breakdown.movement == 0.0
+    assert any("No usable dancer pose" in line for line in result.explanation_lines)
+
+
+def test_missing_user_legs_caps_full_body_reference_score() -> None:
+    ref = _moving_seq("ref", 28)
+    upper_body_user = _moving_seq("upper-body", 28)
+    for frame in upper_body_user.frames:
+        frame.reliability[[25, 26, 27, 28]] = 0.0
+        frame.joints_norm_xy[[25, 26, 27, 28]] = np.nan
+
+    result = compare_pose_sequences(ref, upper_body_user)
+
+    assert result.overall_score <= 20.0
+    assert result.breakdown.legs == 0.0
+    assert result.breakdown.timing <= 55.0
+    assert any("lower body was not visible" in line for line in result.explanation_lines)
 
 
 def test_temporal_stretch_still_high_similarity() -> None:
@@ -133,6 +178,7 @@ def test_empty_sequence_returns_zero() -> None:
     full = _seq("f", 5)
     r = compare_pose_sequences(empty, full)
     assert r.overall_score == 0.0
+    assert r.breakdown.movement == 0.0
 
 
 def test_subsample_alignment_path_shortens_long_paths() -> None:

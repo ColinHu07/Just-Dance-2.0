@@ -29,31 +29,28 @@ _LAMBDA_DTW_TIME_SYNC = 0.42
 # but persistent extra/missing visible limbs still count as a small pose mismatch.
 _VIS_HIDDEN_GATE = 0.35
 _VIS_VISIBLE_GATE = 0.70
-_VIS_MISMATCH_PENALTY_SCALE = 28.0
-_VIS_MISMATCH_MAX_PENALTY = 18.0
+_VIS_MISMATCH_PENALTY_SCALE = 16.0
+_VIS_MISMATCH_MAX_PENALTY = 10.0
 _VIS_ARM_JOINTS = (13, 15, 14, 16)  # elbows/wrists
 _VIS_LEG_JOINTS = (25, 27, 26, 28)  # knees/ankles
 _VIS_COMPARE_JOINTS = _VIS_ARM_JOINTS + _VIS_LEG_JOINTS
+_TORSO_JOINTS = (11, 12, 23, 24)  # shoulders/hips
+_BODY_ANCHOR_JOINTS = _TORSO_JOINTS + _VIS_COMPARE_JOINTS
+_POSE_REL_GATE = 0.55
+_MIN_USER_TORSO_COVERAGE = 0.18
+_MIN_USER_BODY_COVERAGE = 0.12
+_REF_LEG_COVERAGE_REQUIRED = 0.75
+_USER_LEG_COVERAGE_GATE = 0.55
+_MISSING_LEGS_SCORE_BASE = 16.0
+_MISSING_LEGS_SCORE_SCALE = 55.0
+_LOW_TIMING_MOTION_GATE = 35.0
 
-# Overall dance scoring blend. Torso/posture matters, but it should not rescue
-# a run where the dancer skipped the arm/leg hits or barely moved.
-_OVERALL_W_ARMS = 0.28
-_OVERALL_W_LEGS = 0.22
-_OVERALL_W_TORSO = 0.12
-_OVERALL_W_TIMING = 0.16
-_OVERALL_W_MOVEMENT = 0.22
 _MOTION_DIFF_SIGMA = 0.65
 _MOTION_ACTIVITY_FLOOR = 0.035
+_LOW_MOTION_PENALTY_GATE = 40.0
+_LOW_MOTION_PENALTY_SCALE = 0.20
 
 assert abs(WEIGHT_ANGLES + WEIGHT_DIRECTIONS + WEIGHT_DISTANCES + WEIGHT_POSTURE - 1.0) < 1e-6
-assert abs(
-    _OVERALL_W_ARMS
-    + _OVERALL_W_LEGS
-    + _OVERALL_W_TORSO
-    + _OVERALL_W_TIMING
-    + _OVERALL_W_MOVEMENT
-    - 1.0
-) < 1e-6
 
 
 def _angle_diff(a: float, b: float) -> float:
@@ -130,6 +127,38 @@ def _group_similarity(
     return sim_sum, w_sum
 
 
+def _available_weight(
+    v: np.ndarray,
+    w: np.ndarray,
+    mask: np.ndarray,
+    *,
+    is_direction_block: bool,
+) -> float:
+    """Return how much usable data one side has inside ``mask``."""
+    total = 0.0
+    if is_direction_block:
+        idxs = np.where(mask)[0]
+        i = 0
+        while i < len(idxs):
+            k = int(idxs[i])
+            if k + 1 < FEATURE_DIM and mask[k] and mask[k + 1]:
+                if (
+                    float(w[k]) > 0
+                    and np.isfinite(v[k])
+                    and np.isfinite(v[k + 1])
+                ):
+                    total += float(w[k])
+                i += 2
+            else:
+                i += 1
+        return total
+
+    for k in np.where(mask)[0]:
+        if float(w[k]) > 0 and np.isfinite(v[k]):
+            total += float(w[k])
+    return total
+
+
 def frame_similarity_parts(
     a: FrameFeatures,
     b: FrameFeatures,
@@ -151,15 +180,57 @@ def frame_similarity_parts(
     st, wt_sum = _group_similarity(va, wa, vb, wb, g_dist, is_direction_block=False)
     sp, wp_sum = _group_similarity(va, wa, vb, wb, g_post, is_direction_block=False)
 
-    def norm(val: float, denom: float) -> float:
+    def norm(
+        val: float,
+        denom: float,
+        mask: np.ndarray,
+        *,
+        is_direction_block: bool,
+    ) -> float:
         if denom < 1e-8:
-            return 100.0
+            a_total = _available_weight(
+                va,
+                wa,
+                mask,
+                is_direction_block=is_direction_block,
+            )
+            b_total = _available_weight(
+                vb,
+                wb,
+                mask,
+                is_direction_block=is_direction_block,
+            )
+            if a_total < 1e-8 and b_total < 1e-8:
+                return 100.0
+            # One side had usable body data and the other did not. That is a
+            # missed detection/performance mismatch, not a perfect match.
+            return 0.0
         return val / denom
 
-    sim_a = norm(sa, wa_sum)
-    sim_d = norm(sd, wd_sum)
-    sim_t = norm(st, wt_sum)
-    sim_p = norm(sp, wp_sum)
+    sim_a = norm(
+        sa,
+        wa_sum,
+        g_ang,
+        is_direction_block=False,
+    )
+    sim_d = norm(
+        sd,
+        wd_sum,
+        g_dir,
+        is_direction_block=True,
+    )
+    sim_t = norm(
+        st,
+        wt_sum,
+        g_dist,
+        is_direction_block=False,
+    )
+    sim_p = norm(
+        sp,
+        wp_sum,
+        g_post,
+        is_direction_block=False,
+    )
 
     comb = (
         WEIGHT_ANGLES * sim_a
@@ -168,6 +239,117 @@ def frame_similarity_parts(
         + WEIGHT_POSTURE * sim_p
     )
     return sim_a, sim_d, sim_t, sim_p, comb
+
+
+def _joint_coverage(feat: FrameFeatures, joints: Tuple[int, ...]) -> float:
+    rel = feat.joint_reliability
+    if rel is None or not joints:
+        return 0.0
+    found = 0
+    total = 0
+    for idx in joints:
+        if idx >= len(rel):
+            continue
+        total += 1
+        if float(rel[idx]) >= _POSE_REL_GATE:
+            found += 1
+    if total == 0:
+        return 0.0
+    return found / total
+
+
+def _mean_joint_coverage(feats: List[FrameFeatures], joints: Tuple[int, ...]) -> float:
+    if not feats:
+        return 0.0
+    return float(sum(_joint_coverage(f, joints) for f in feats) / len(feats))
+
+
+def _missing_required_legs_cap(user_leg_coverage: float) -> float:
+    return max(
+        0.0,
+        min(100.0, _MISSING_LEGS_SCORE_BASE + user_leg_coverage * _MISSING_LEGS_SCORE_SCALE),
+    )
+
+
+def _leg_visibility_score(user_leg_coverage: float) -> float:
+    ratio = user_leg_coverage / max(_USER_LEG_COVERAGE_GATE, 1e-6)
+    return max(0.0, min(55.0, ratio * 55.0))
+
+
+def _zero_result(message: str) -> ComparisonResult:
+    z = np.zeros(0, dtype=np.float64)
+    p = np.zeros((0, 2), dtype=np.int64)
+    bd = ScoreBreakdown(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    return ComparisonResult(
+        overall_score=0.0,
+        breakdown=bd,
+        explanation_lines=[message],
+        per_frame_similarity=z,
+        alignment_path=p,
+        dtw_total_cost=0.0,
+        dtw_mean_cost=0.0,
+        timing_mean_abs_lag_frames=0.0,
+    )
+
+
+def _zero_user_pose_result() -> ComparisonResult:
+    return _zero_result(
+        "No usable dancer pose was detected in your camera recording. "
+        "Make sure your full body is in frame, with shoulders and hips visible, then try again."
+    )
+
+
+def _score_from_group_sum(
+    value_sum: float,
+    shared_weight: float,
+    ref_available: float,
+    user_available: float,
+) -> float:
+    if shared_weight < 1e-8:
+        if ref_available < 1e-8 and user_available < 1e-8:
+            return float("nan")
+        return 0.0
+    return value_sum / shared_weight
+
+
+def _available_weight_path(
+    path: np.ndarray,
+    feats: List[FrameFeatures],
+    side: int,
+    mask: np.ndarray,
+    *,
+    is_direction_block: bool,
+) -> float:
+    total = 0.0
+    for t in range(path.shape[0]):
+        idx = int(path[t, side])
+        f = feats[idx]
+        total += _available_weight(
+            f.vector,
+            f.dim_weight,
+            mask,
+            is_direction_block=is_direction_block,
+        )
+    return total
+
+
+def _mask_similarity_from_sums(
+    path: np.ndarray,
+    feats_r: List[FrameFeatures],
+    feats_u: List[FrameFeatures],
+    mask: np.ndarray,
+    *,
+    is_direction_block: bool,
+    value_sum: float,
+    shared_weight: float,
+) -> float:
+    ref_available = _available_weight_path(
+        path, feats_r, 0, mask, is_direction_block=is_direction_block
+    )
+    user_available = _available_weight_path(
+        path, feats_u, 1, mask, is_direction_block=is_direction_block
+    )
+    return _score_from_group_sum(value_sum, shared_weight, ref_available, user_available)
 
 
 def frame_dissimilarity(a: FrameFeatures, b: FrameFeatures) -> float:
@@ -360,9 +542,15 @@ def _mask_mean_similarity(
         s, w = _group_similarity(va, wa, vb, wb, mask, is_direction_block=is_direction_block)
         num += s
         den += w
-    if den < 1e-8:
-        return float("nan")
-    return num / den
+    return _mask_similarity_from_sums(
+        path,
+        feats_r,
+        feats_u,
+        mask,
+        is_direction_block=is_direction_block,
+        value_sum=num,
+        shared_weight=den,
+    )
 
 
 def _region_similarity_path(
@@ -400,9 +588,16 @@ def _region_similarity_path(
             s, w = _group_similarity(va, wa, vb, wb, m, is_direction_block=is_dir)
             num += s
             den += w
-    if den < 1e-8:
-        return float("nan")
-    return num / den
+    ref_available = 0.0
+    user_available = 0.0
+    for m, is_dir in ((ang, False), (dir_mask, True), (dist, False)):
+        ref_available += _available_weight_path(
+            path, feats_r, 0, m, is_direction_block=is_dir
+        )
+        user_available += _available_weight_path(
+            path, feats_u, 1, m, is_direction_block=is_dir
+        )
+    return _score_from_group_sum(num, den, ref_available, user_available)
 
 
 def _timing_score_from_path(path: np.ndarray, n_ref: int, n_user: int) -> Tuple[float, float, float]:
@@ -458,6 +653,7 @@ def _build_explanation(
     visibility_penalty: float = 0.0,
     user_extra_ratio: float = 0.0,
     user_missing_ratio: float = 0.0,
+    missing_required_legs: bool = False,
 ) -> List[str]:
     lines: List[str] = []
     ml, mr = _left_right_arm_masks()
@@ -474,7 +670,7 @@ def _build_explanation(
                 "Your right-side shapes are reading cleaner. Bring the left arm "
                 "through with the same intention and the score should climb."
             )
-    if math.isfinite(legs) and legs >= 78.0 and movement >= 65.0:
+    if math.isfinite(legs) and legs >= 78.0:
         lines.append(
             "Footwork is a bright spot: your leg shapes matched the reference closely overall."
         )
@@ -483,7 +679,7 @@ def _build_explanation(
             "The groove is there, but the lower-body shapes need the next polish pass. "
             "Recheck knee and foot placement on the bigger transitions."
         )
-    if math.isfinite(torso) and torso >= 88.0 and movement >= 58.0:
+    if math.isfinite(torso) and torso >= 88.0:
         lines.append(
             "Your posture stayed clean, which makes the whole run easier to read."
         )
@@ -496,7 +692,7 @@ def _build_explanation(
             "The moves are recognizable; the biggest unlock is timing. "
             "Count into the first beat and try landing each accent a touch closer to the reference."
         )
-    elif math.isfinite(timing) and timing >= 85.0 and movement >= 65.0:
+    elif math.isfinite(timing) and timing >= 85.0:
         lines.append(
             "Timing felt locked in; your rhythm stayed strong against the reference."
         )
@@ -508,6 +704,11 @@ def _build_explanation(
     elif math.isfinite(movement) and movement >= 82.0:
         lines.append(
             "Movement energy matched the reference nicely; you kept the run alive instead of marking it."
+        )
+    if missing_required_legs:
+        lines.append(
+            "Camera note: this reference needs full-body tracking, but your lower body was not visible "
+            "often enough, so the score was capped. Step back until both feet stay in frame."
         )
     if visibility_penalty >= 2.0:
         if user_extra_ratio > user_missing_ratio * 1.25:
@@ -544,19 +745,21 @@ def compare_feature_sequences(
     n_r = len(feats_r)
     n_u = len(feats_u)
     if n_r == 0 or n_u == 0:
-        z = np.zeros(0, dtype=np.float64)
-        p = np.zeros((0, 2), dtype=np.int64)
-        bd = ScoreBreakdown(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        return ComparisonResult(
-            overall_score=0.0,
-            breakdown=bd,
-            explanation_lines=["Not enough pose data in one or both videos to compare."],
-            per_frame_similarity=z,
-            alignment_path=p,
-            dtw_total_cost=0.0,
-            dtw_mean_cost=0.0,
-            timing_mean_abs_lag_frames=0.0,
+        return _zero_result("Not enough pose data in one or both videos to compare.")
+
+    ref_torso_coverage = _mean_joint_coverage(feats_r, _TORSO_JOINTS)
+    user_torso_coverage = _mean_joint_coverage(feats_u, _TORSO_JOINTS)
+    user_body_coverage = _mean_joint_coverage(feats_u, _BODY_ANCHOR_JOINTS)
+    ref_leg_coverage = _mean_joint_coverage(feats_r, _VIS_LEG_JOINTS)
+    user_leg_coverage = _mean_joint_coverage(feats_u, _VIS_LEG_JOINTS)
+    if (
+        ref_torso_coverage >= _MIN_USER_TORSO_COVERAGE
+        and (
+            user_torso_coverage < _MIN_USER_TORSO_COVERAGE
+            or user_body_coverage < _MIN_USER_BODY_COVERAGE
         )
+    ):
+        return _zero_user_pose_result()
 
     path, total_cost = dtw_align(feats_r, feats_u, _make_dtw_local_cost(feats_r, feats_u))
     k = int(path.shape[0])
@@ -598,13 +801,17 @@ def compare_feature_sequences(
         arms = max(0.0, arms - _visibility_penalty_from_ratio(arm_visibility_ratio))
     if math.isfinite(legs):
         legs = max(0.0, legs - _visibility_penalty_from_ratio(leg_visibility_ratio))
+    missing_required_legs = (
+        ref_leg_coverage >= _REF_LEG_COVERAGE_REQUIRED
+        and user_leg_coverage < _USER_LEG_COVERAGE_GATE
+    )
+    if missing_required_legs:
+        leg_base = float(legs) if math.isfinite(legs) else 100.0
+        legs = min(leg_base, _leg_visibility_score(user_leg_coverage))
 
     timing, _mean_norm_lag, mean_frame_lag = _timing_score_from_path(
         path, max(n_r, 1), max(n_u, 1)
     )
-
-    def nan_to_num(x: float, fallback: float) -> float:
-        return float(x) if math.isfinite(x) else fallback
 
     motion_mask = (
         g.get("angles", np.zeros(FEATURE_DIM, dtype=bool))
@@ -612,22 +819,26 @@ def compare_feature_sequences(
         | g.get("distances", np.zeros(FEATURE_DIM, dtype=bool))
     )
     movement = _path_motion_similarity(path, feats_r, feats_u, motion_mask)
+    if movement < _LOW_TIMING_MOTION_GATE:
+        timing = min(timing, 45.0 + movement)
+    if missing_required_legs:
+        timing = min(timing, 55.0 + user_leg_coverage * 35.0)
 
-    arms_score = nan_to_num(arms, max(0.0, frame_overall - _visibility_penalty_from_ratio(arm_visibility_ratio)))
-    legs_score = nan_to_num(legs, max(0.0, frame_overall - _visibility_penalty_from_ratio(leg_visibility_ratio)))
+    def nan_to_num(x: float, fallback: float) -> float:
+        return float(x) if math.isfinite(x) else fallback
+
+    overall = frame_overall
+    if movement < _LOW_MOTION_PENALTY_GATE:
+        overall = max(
+            0.0,
+            overall - (_LOW_MOTION_PENALTY_GATE - movement) * _LOW_MOTION_PENALTY_SCALE,
+        )
+    if missing_required_legs:
+        overall = min(overall, _missing_required_legs_cap(user_leg_coverage))
+
+    arms_score = nan_to_num(arms, overall)
+    legs_score = nan_to_num(legs, overall)
     torso_score = nan_to_num(torso, frame_overall)
-    overall = (
-        _OVERALL_W_ARMS * arms_score
-        + _OVERALL_W_LEGS * legs_score
-        + _OVERALL_W_TORSO * torso_score
-        + _OVERALL_W_TIMING * timing
-        + _OVERALL_W_MOVEMENT * movement
-    )
-    overall = max(0.0, min(100.0, overall - 0.35 * _visibility_penalty_from_ratio(visibility_ratio)))
-    if movement < 60.0:
-        # If the reference has real motion and the user mostly marks/stands,
-        # stable torso and clip length should not inflate the final grade.
-        overall = min(overall, 34.0 + movement * 0.55)
 
     bd = ScoreBreakdown(
         overall=overall,
@@ -653,6 +864,7 @@ def compare_feature_sequences(
         _visibility_penalty_from_ratio(visibility_ratio),
         user_extra_ratio,
         user_missing_ratio,
+        missing_required_legs,
     )
 
     return ComparisonResult(

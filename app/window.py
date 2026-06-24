@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 from app import comparison_view
 from app.calibration import CalibrationReport
 from app.dance_library import (
+    DanceScoreRecord,
     append_score_record,
     best_score_for_dance,
     delete_dance,
@@ -63,6 +64,7 @@ from app.comparison_worker import (
     save_comparison_json,
 )
 from app.ffmpeg_audio import extract_audio_to_mp3
+from app.game_scoring import GameScore, build_game_score
 from app.style import APP_STYLESHEET
 from app.worker import ProcessVideoWorker
 
@@ -248,6 +250,9 @@ class MainWindow(QMainWindow):
         self._frontend_record_path: str | None = None
         self._frontend_record_size: tuple[int, int] | None = None
         self._frontend_record_frame_count: int = 0
+        self._frontend_record_fps: float = 30.0
+        self._frontend_record_started_at: float = 0.0
+        self._frontend_record_last_frame_slot: int = -1
         self._frontend_pending_compare_after_extract: bool = False
         self._frontend_scoring_active: bool = False
         self._challenge_audio_output: QAudioOutput | None = None
@@ -1124,13 +1129,50 @@ class MainWindow(QMainWindow):
         dance_id = self.frontend_dance_combo.currentData()
         return str(dance_id) if dance_id else None
 
+    def _game_points_from_record(self, record: DanceScoreRecord | None) -> int | None:
+        if record is None or not isinstance(record.details, dict):
+            return None
+        value = record.details.get("game_points")
+        try:
+            points = int(value)
+        except (TypeError, ValueError):
+            return None
+        return points if points >= 0 else None
+
+    def _best_game_record(
+        self,
+        dance_id: str | None,
+        *,
+        player_count: int | None = None,
+    ) -> DanceScoreRecord | None:
+        if not dance_id:
+            return None
+        records = load_score_history(dance_id)
+        if player_count is not None:
+            records = [r for r in records if r.player_count == player_count]
+        records = [r for r in records if self._game_points_from_record(r) is not None]
+        if not records:
+            return None
+        return max(records, key=lambda r: self._game_points_from_record(r) or 0)
+
     def _frontend_best_score_suffix(self, dance_id: str | None = None) -> str:
         dance_id = dance_id or self._selected_frontend_dance_id()
         if not dance_id:
             return ""
+        player_count = self._frontend_expected_people()
+        best_game = self._best_game_record(dance_id, player_count=player_count)
+        if best_game is not None:
+            points = self._game_points_from_record(best_game)
+            rank = ""
+            if isinstance(best_game.details, dict):
+                rank_value = best_game.details.get("game_rank")
+                if rank_value:
+                    rank = f" · {rank_value}"
+            if points is not None:
+                return f" · best {points:,} pts{rank}"
         best = best_score_for_dance(
             dance_id,
-            player_count=self._frontend_expected_people(),
+            player_count=player_count,
         )
         if best is None:
             return ""
@@ -1532,11 +1574,9 @@ class MainWindow(QMainWindow):
         self._stop_frontend_camera_recording()
         video_utils.ensure_app_dirs()
         h, w = frame.shape[:2]
-        fps = 30.0
-        if self._frontend_camera_cap is not None:
-            camera_fps = float(self._frontend_camera_cap.get(cv2.CAP_PROP_FPS) or 0.0)
-            if 5.0 <= camera_fps <= 60.0:
-                fps = camera_fps
+        fps = self._ref_practice_base_fps if self._ref_practice_base_fps > 0 else 30.0
+        if not (5.0 <= fps <= 60.0):
+            fps = 30.0
         path = video_utils.TEMP_DIR / f"frontend_performance_{uuid.uuid4().hex[:10]}.mp4"
         try:
             result = video_utils.create_writer(str(path), w, h, fps)
@@ -1547,6 +1587,9 @@ class MainWindow(QMainWindow):
         self._frontend_record_path = result.path
         self._frontend_record_size = (result.width, result.height)
         self._frontend_record_frame_count = 0
+        self._frontend_record_fps = float(result.fps)
+        self._frontend_record_started_at = time.monotonic()
+        self._frontend_record_last_frame_slot = -1
 
     def _write_frontend_camera_recording_frame(self, frame) -> None:
         if self._frontend_record_writer is None:
@@ -1556,8 +1599,14 @@ class MainWindow(QMainWindow):
             w, h = self._frontend_record_size
             if frame.shape[1] != w or frame.shape[0] != h:
                 out_frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-        self._frontend_record_writer.write(out_frame)
-        self._frontend_record_frame_count += 1
+        elapsed = max(0.0, time.monotonic() - self._frontend_record_started_at)
+        target_slot = int(elapsed * max(1.0, self._frontend_record_fps))
+        frames_to_write = max(1, target_slot - self._frontend_record_last_frame_slot)
+        frames_to_write = min(frames_to_write, 90)
+        for _ in range(frames_to_write):
+            self._frontend_record_writer.write(out_frame)
+            self._frontend_record_frame_count += 1
+        self._frontend_record_last_frame_slot += frames_to_write
 
     def _stop_frontend_camera_recording(self) -> str | None:
         path = self._frontend_record_path
@@ -1568,6 +1617,9 @@ class MainWindow(QMainWindow):
         self._frontend_record_path = None
         self._frontend_record_size = None
         self._frontend_record_frame_count = 0
+        self._frontend_record_fps = 30.0
+        self._frontend_record_started_at = 0.0
+        self._frontend_record_last_frame_slot = -1
         return path if path and frames > 3 else None
 
     def _start_frontend_backdrop_video(self) -> None:
@@ -4131,13 +4183,23 @@ class MainWindow(QMainWindow):
             "source": "frontend_completion",
         }
         stats_line = "Practice finished. Pose score was not saved for this run."
+        game: GameScore | None = None
         if self._last_comparison is not None:
             score = float(self._last_comparison.overall_score)
-            score_label = "Similarity"
+            score_label = "Score"
+            game = build_game_score(self._last_comparison)
             bd = self._last_comparison.breakdown
             details.update(
                 {
                     "source": "comparison",
+                    "raw_similarity": round(float(score), 3),
+                    "game_points": int(game.points),
+                    "game_max_points": int(game.max_points),
+                    "game_accuracy": round(float(game.accuracy), 3),
+                    "game_rank": game.rank,
+                    "game_hit_counts": dict(game.hit_counts),
+                    "game_max_combo": int(game.max_combo),
+                    "game_total_windows": int(game.total_windows),
                     "timing": round(float(bd.timing), 3),
                     "arms": round(float(bd.arms), 3),
                     "legs": round(float(bd.legs), 3),
@@ -4153,15 +4215,18 @@ class MainWindow(QMainWindow):
                 }
             )
             stats_line = (
+                f"Rank {game.rank} · {game.hit_summary}\n"
+                f"Max combo {game.max_combo}/{game.total_windows} · "
+                f"Groove {game.accuracy:.0f}% · Raw similarity {score:.0f}%\n"
                 f"Timing {bd.timing:.0f}% · Arms {bd.arms:.0f}% · "
-                f"Legs {bd.legs:.0f}% · Torso {bd.torso_posture:.0f}% · "
-                f"Movement {bd.movement:.0f}%"
+                f"Legs {bd.legs:.0f}% · Movement {bd.movement:.0f}%"
             )
         elif error_message:
             score_label = "Needs retry"
             stats_line = f"No pose score saved: {error_message}"
 
         best_before = best_score_for_dance(dance_id, player_count=players) if dance_id else None
+        best_game_before = self._best_game_record(dance_id, player_count=players)
         record = None
         run_count = 0
         if dance_id and score is not None:
@@ -4175,17 +4240,39 @@ class MainWindow(QMainWindow):
             history = load_score_history(dance_id)
             run_count = len([r for r in history if r.player_count == players])
         best_after = best_score_for_dance(dance_id, player_count=players) if dance_id else None
+        best_game_after = self._best_game_record(dance_id, player_count=players)
         best_score = best_after.score if best_after is not None else score
         previous_best = best_before.score if best_before is not None else None
         is_new_best = score is not None and (previous_best is None or score >= previous_best)
 
-        self.frontend_results_title.setText(f"{name} Results")
+        self.frontend_results_title.setText(
+            f"{name} Results" if game is None else f"{name} Results · Rank {game.rank}"
+        )
         if score is None:
             self.frontend_results_score.setText(score_label)
+        elif game is not None:
+            self.frontend_results_score.setText(f"{game.points:,} pts")
         else:
             self.frontend_results_score.setText(f"{score_label}: {score:.0f}%")
         duration_text = self._format_time(duration) if duration > 0 else "--"
-        if best_score is None:
+        best_game_points = self._game_points_from_record(best_game_after)
+        previous_game_points = self._game_points_from_record(best_game_before)
+        if game is not None and best_game_points is not None:
+            rank = ""
+            if best_game_after is not None and isinstance(best_game_after.details, dict):
+                rank_value = best_game_after.details.get("game_rank")
+                if rank_value:
+                    rank = f" · {rank_value}"
+            is_new_game_best = (
+                previous_game_points is None
+                or int(game.points) >= previous_game_points
+            )
+            best_line = (
+                f"New best: {best_game_points:,} pts{rank}"
+                if is_new_game_best
+                else f"Best: {best_game_points:,} pts{rank}"
+            )
+        elif best_score is None:
             best_line = "No best score yet"
         else:
             best_line = (
